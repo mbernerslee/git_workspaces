@@ -218,7 +218,10 @@ end)
     ln -sf "$main_clone/.env" "$dest/.env"
     echo_success "Symlinked .env"
   fi
-  if [[ -f "$main_clone/.envrc" ]]; then
+  # Skip the .envrc symlink when the repo has a .ws-init hook — that hook
+  # generates its own per-worktree .envrc, so there's nothing to symlink (and
+  # writing over a symlink would clobber the main clone's file).
+  if [[ -f "$main_clone/.envrc" && ! -x "$main_clone/.ws-init" ]]; then
     ln -sf "$main_clone/.envrc" "$dest/.envrc"
     echo_success "Symlinked .envrc"
     direnv allow "$dest"
@@ -231,6 +234,16 @@ end)
     mkdir -p "$dest/.claude"
     ln -sf "$main_clone/.claude/settings.local.json" "$dest/.claude/settings.local.json"
     echo_success "Symlinked .claude/settings.local.json"
+  fi
+
+  # If the repo's main clone has an executable .ws-init hook, run it with the
+  # new worktree as cwd. This lets a repo set itself up per-workspace (ports,
+  # DB, env, …) without the workspace layer knowing anything project-specific.
+  # The hook lives in the main clone (typically git-excluded / private), so it
+  # applies to every worktree without being committed.
+  if [[ -x "$main_clone/.ws-init" ]]; then
+    echo_info "Running .ws-init from $(basename "$main_clone")..."
+    ( cd "$dest" && "$main_clone/.ws-init" )
   fi
 }
 
