@@ -1,0 +1,17 @@
+[metadata]
+name = "wt-add"
+description = "Pick a repo from ~/src to add to the current workspace"
+
+[source]
+command = "~/src/dev_setup/scripts/src-repos-list.sh \"$(cat /tmp/tv-ws 2>/dev/null)\""
+
+[preview]
+command = "git -C '{}' log --oneline -15 2>/dev/null"
+
+[keybindings]
+enter = "actions:add"
+
+[actions.add]
+description = "Add this repo as a worktree to the current workspace"
+command = "~/src/dev_setup/scripts/wt-add.sh '{}'"
+mode = "execute"

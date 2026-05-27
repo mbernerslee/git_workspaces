@@ -1,0 +1,23 @@
+[metadata]
+name = "wt"
+description = "Switch worktrees in the current workspace"
+
+[source]
+command = "~/src/dev_setup/scripts/wt-list.sh"
+
+[preview]
+command = "cd '{}' && git branch --show-current && echo '---' && git log --oneline -10 && echo '---' && git status -s"
+
+[keybindings]
+enter = "actions:switch"
+ctrl-n = "actions:add"
+
+[actions.switch]
+description = "Switch the workspace window into this worktree"
+command = "~/src/dev_setup/scripts/wt-switch.sh '{}'"
+mode = "execute"
+
+[actions.add]
+description = "Add another repo to this workspace"
+command = "tv wt-add"
+mode = "execute"

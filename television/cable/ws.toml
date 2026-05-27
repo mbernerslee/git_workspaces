@@ -1,0 +1,35 @@
+[metadata]
+name = "ws"
+description = "Browse and manage workspaces (multi-repo git worktrees)"
+
+[source]
+command = "ls -1d ~/src/workspaces/*/ 2>/dev/null | sed 's:/*$::'"
+
+[preview]
+command = "for r in '{}'/*/; do [ -d \"$r\" ] || continue; b=$(git -C \"$r\" branch --show-current 2>/dev/null); echo \"▸ $(basename \"$r\")  [$b]\"; git -C \"$r\" status -s 2>/dev/null | sed 's/^/    /'; done"
+
+[keybindings]
+enter = "actions:switch"
+ctrl-g = "actions:repos"
+ctrl-n = "actions:new"
+ctrl-d = "actions:delete"
+
+[actions.switch]
+description = "Switch to this workspace's tmux window"
+command = "~/src/dev_setup/scripts/ws-switch.sh '{}'"
+mode = "execute"
+
+[actions.repos]
+description = "Drill into this workspace's repos / worktrees"
+command = "echo '{}' > /tmp/tv-ws && tv wt"
+mode = "execute"
+
+[actions.new]
+description = "Create a new workspace (pick a repo, then a branch)"
+command = "tv ws-new"
+mode = "execute"
+
+[actions.delete]
+description = "Delete the workspace (worktrees + dir; branches kept)"
+command = "~/src/dev_setup/scripts/ws-delete.sh '{}'"
+mode = "execute"

@@ -1,0 +1,17 @@
+[metadata]
+name = "ws-new"
+description = "Pick a repo from ~/src to start a new workspace"
+
+[source]
+command = "~/src/dev_setup/scripts/src-repos-list.sh"
+
+[preview]
+command = "git -C '{}' log --oneline -15 2>/dev/null"
+
+[keybindings]
+enter = "actions:create"
+
+[actions.create]
+description = "Create a workspace from this repo (prompts for a branch)"
+command = "~/src/dev_setup/scripts/ws-create.sh '{}'"
+mode = "execute"
