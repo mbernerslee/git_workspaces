@@ -8,7 +8,8 @@
 # workspace; switching a worktree just cd's that window's pane into the repo.
 #
 # Commands:
-#   wsc <branch>          create a workspace from the current repo
+#   wsc [--bg] <branch>   create a workspace from the current repo (--bg: don't
+#                         switch to the new tmux windows)
 #   wsa <repo> [repo...]  add repos to the workspace you're standing in
 #   wsd [name|path]       delete a workspace (worktrees + dir; branches kept)
 #   ws                    TV: workspaces — enter=switch, ctrl-g=drill into repos,
@@ -162,8 +163,26 @@ _ws_setup_worktree() {
     echo_info "Copying node_modules/..."
     cp -Rc "$main_clone/node_modules" "$dest/node_modules"
   fi
-  # git worktree add sets source mtimes to NOW; bump _build/deps mtimes so Mix
-  # doesn't see every source file as newer than its build artifact.
+  # git worktree add stamps EVERY checked-out file with the current time, which
+  # breaks incremental builds whose manifests store per-file mtimes. Elixir
+  # 1.20's compile.elixir manifest bakes in the mtimes of mix.exs, config/*.exs
+  # and every source; on the next `mix compile` it compares those stored mtimes
+  # against the files on disk. Since the worktree's files are all "now" (newer
+  # than what the copied manifest recorded in the main clone), Mix decides
+  # mix.exs/config changed and forces a FULL recompile — exactly the artifact
+  # reuse we copied _build to avoid. Fix it by restoring each tracked file's
+  # mtime from the main clone (same commit = same content), so the worktree
+  # looks mtime-identical to the state the manifest was built against. -z makes
+  # this robust to spaces/newlines in paths. (Repo-agnostic: copying mtimes from
+  # an identical checkout is always safe, and helps any incremental toolchain.)
+  echo_info "Restoring file mtimes from $(basename "$main_clone")..."
+  git -C "$dest" ls-files -z | while IFS= read -r -d '' f; do
+    [[ -e "$main_clone/$f" && -e "$dest/$f" ]] && touch -r "$main_clone/$f" "$dest/$f"
+  done
+
+  # Bump _build/deps mtimes to NOW so build artifacts stay newer than the sources
+  # above (belt-and-braces for tools that compare artifact-vs-source mtimes).
+  # These are gitignored, so the ls-files pass above never touched them.
   local to_touch=()
   [[ -d "$dest/deps" ]] && to_touch+=("$dest/deps")
   [[ -d "$dest/_build" ]] && to_touch+=("$dest/_build")
@@ -235,6 +254,10 @@ end)
     ln -sf "$main_clone/.claude/settings.local.json" "$dest/.claude/settings.local.json"
     echo_success "Symlinked .claude/settings.local.json"
   fi
+  if [[ -f "$main_clone/CLAUDE.local.md" ]]; then
+    ln -sf "$main_clone/CLAUDE.local.md" "$dest/CLAUDE.local.md"
+    echo_success "Symlinked CLAUDE.local.md"
+  fi
 
   # If the repo's main clone has an executable .ws-init hook, run it with the
   # new worktree as cwd. This lets a repo set itself up per-workspace (ports,
@@ -247,16 +270,19 @@ end)
   fi
 }
 
-# _ws_create <repo|path> <branch> — create a workspace from a repo + branch.
+# _ws_create <repo|path> <branch> [--bg] — create a workspace from a repo + branch.
 # Repo-agnostic (the branch is based off origin's default by _ws_setup_worktree,
-# so the clone needn't be on master). Opens and selects the workspace window.
+# so the clone needn't be on master). Opens and selects the workspace window;
+# with --bg the window is created in the background and not selected.
 _ws_create() {
   if [[ -z "$1" || -z "$2" ]]; then
-    echo_failure "Usage: _ws_create <repo|path> <branch>"
+    echo_failure "Usage: _ws_create <repo|path> <branch> [--bg]"
     return 1
   fi
   local main_clone=$(_ws_resolve_main_clone "$1")
   local branch="$2"
+  local bg=""
+  [[ "$3" == "--bg" ]] && bg=1
   if [[ ! -e "$main_clone/.git" ]]; then
     echo_failure "No git repo at $main_clone"
     return 1
@@ -282,12 +308,17 @@ _ws_create() {
   _ws_setup_worktree "$main_clone" "$branch" "$workspace/$repo" || { rmdir "$workspace" 2>/dev/null; return 1; }
 
   # Open the workspace window with its pane already in the repo we just made.
-  "$_WS_TPC" goto mob-editor "$short" "$workspace/$repo"
-  "$_WS_TPC" select mob-editor "$short"
+  # With --bg, create it without switching to it.
+  if [[ -n "$bg" ]]; then
+    "$_WS_TPC" goto mob-editor "$short" "$workspace/$repo" --bg
+  else
+    "$_WS_TPC" goto mob-editor "$short" "$workspace/$repo"
+    "$_WS_TPC" select mob-editor "$short"
+  fi
 
   echo_success "Workspace ready: $workspace"
   echo_success "Added '$repo' on branch '$branch'"
-  echo_success "Tmux window '$short' created"
+  echo_success "Tmux window '$short' created${bg:+ (in background)}"
 }
 
 # _ws_add <workspace> <repo|path> [repo...] — add repos to a workspace, all on
@@ -384,14 +415,22 @@ _ws_delete() {
   echo_success "Deleted workspace: $workspace"
 }
 
-# wsc <branch> — create a workspace from the repo in the current directory.
+# wsc [--bg] <branch> — create a workspace from the repo in the current directory.
 # Works whether you're in the repo's main clone or inside an existing worktree:
 # it resolves the main clone (where the true source lives) and bases the new
 # branch off origin's default, so you can spin up a fresh workspace from within
-# another one without inheriting its branch.
+# another one without inheriting its branch. --bg creates the tmux windows
+# without switching to them.
 function wsc() {
-  if [[ -z "$1" ]]; then
-    echo_failure "Usage: wsc <branch-name>"
+  local bg="" branch="" arg
+  for arg in "$@"; do
+    case "$arg" in
+      --bg) bg="--bg" ;;
+      *) branch="$arg" ;;
+    esac
+  done
+  if [[ -z "$branch" ]]; then
+    echo_failure "Usage: wsc [--bg] <branch-name>"
     return 1
   fi
   # The first `git worktree list` entry is the main clone, even from a worktree.
@@ -401,7 +440,7 @@ function wsc() {
     echo_failure "Not in a git repo"
     return 1
   fi
-  _ws_create "$main_clone" "$1"
+  _ws_create "$main_clone" "$branch" $bg
 }
 
 # wsa <repo> [repo...] — add repos to the workspace the current dir lives in.
