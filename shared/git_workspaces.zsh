@@ -164,31 +164,30 @@ _ws_setup_worktree() {
     cp -Rc "$main_clone/node_modules" "$dest/node_modules"
   fi
   # git worktree add stamps EVERY checked-out file with the current time, which
-  # breaks incremental builds whose manifests store per-file mtimes. Elixir
-  # 1.20's compile.elixir manifest bakes in the mtimes of mix.exs, config/*.exs
-  # and every source; on the next `mix compile` it compares those stored mtimes
-  # against the files on disk. Since the worktree's files are all "now" (newer
-  # than what the copied manifest recorded in the main clone), Mix decides
-  # mix.exs/config changed and forces a FULL recompile — exactly the artifact
-  # reuse we copied _build to avoid. Fix it by restoring each tracked file's
-  # mtime from the main clone (same commit = same content), so the worktree
-  # looks mtime-identical to the state the manifest was built against. -z makes
-  # this robust to spaces/newlines in paths. (Repo-agnostic: copying mtimes from
-  # an identical checkout is always safe, and helps any incremental toolchain.)
+  # breaks Elixir's incremental build. On `mix compile`, Mix compares the mtime
+  # of mix.exs and config/*.exs against what the copied manifest recorded; if
+  # any are newer it concludes "config changed" and forces a FULL recompile —
+  # the digest fallback that protects ordinary source files does NOT apply to
+  # this config-staleness check, so the relocated _build is thrown away. Restore
+  # each tracked file's mtime from the main clone (same commit = same content),
+  # so the worktree looks mtime-identical to the state the manifest was built
+  # against. -z makes this robust to spaces/newlines in paths. (Repo-agnostic:
+  # copying mtimes from an identical checkout is always safe.)
   echo_info "Restoring file mtimes from $(basename "$main_clone")..."
   git -C "$dest" ls-files -z | while IFS= read -r -d '' f; do
     [[ -e "$main_clone/$f" && -e "$dest/$f" ]] && touch -r "$main_clone/$f" "$dest/$f"
   done
 
-  # Bump _build/deps mtimes to NOW so build artifacts stay newer than the sources
-  # above (belt-and-braces for tools that compare artifact-vs-source mtimes).
-  # These are gitignored, so the ls-files pass above never touched them.
-  local to_touch=()
-  [[ -d "$dest/deps" ]] && to_touch+=("$dest/deps")
-  [[ -d "$dest/_build" ]] && to_touch+=("$dest/_build")
-  if (( ${#to_touch[@]} )); then
-    find "${to_touch[@]}" -exec touch {} +
-  fi
+  # NOTE: do NOT bump _build/deps mtimes to "now". cp -Rc (APFS clone) already
+  # preserves the main clone's mtimes, which is exactly what the manifest
+  # expects. Touching _build forward re-breaks the build: Mix.Project's config
+  # set includes _build/<env>/lib/<app>/.mix/compile.lock, so a freshly-touched
+  # compile.lock looks newer than the manifest → "config changed" → full
+  # recompile. (This is a verified footgun, not a hypothetical: a prior
+  # `find _build -exec touch` step here caused exactly that.) Elixir never
+  # compares artifact-vs-source file mtimes directly — it uses the manifest's
+  # own recorded mtimes plus per-source content digests — so there is nothing
+  # to gain by making artifacts "newer", only this regression to cause.
 
   # Mix bakes the absolute project path into _build/**/.mix/compile.elixir (as
   # the manifest cwd / cache_key). On the next `mix compile`, Mix compares that
