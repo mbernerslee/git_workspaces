@@ -108,6 +108,24 @@ _ws_setup_worktree() {
     return 1
   fi
 
+  # Per-repo workspace setup hook. A single executable .ws-init in the main clone
+  # (typically git-excluded / private, so it applies to every worktree without
+  # being committed) is invoked TWICE per worktree, with the phase as $1:
+  #   pre  — BEFORE the worktree is created (cwd = main clone; dest not yet made)
+  #   post — AFTER it is fully set up      (cwd = the new worktree == WS_DEST)
+  # The hook defines shell functions `ws_pre` / `ws_post` and dispatches on the
+  # phase, defining only the phase(s) it cares about. Both phases get the same
+  # context via env: WS_DEST / WS_BRANCH / WS_MAIN_CLONE. A non-zero `pre` ABORTS
+  # creation — the pre phase is treated as a precondition.
+  if [[ -x "$main_clone/.ws-init" ]]; then
+    echo_info "Running .ws-init pre from $(basename "$main_clone")..."
+    if ! ( cd "$main_clone" && WS_DEST="$dest" WS_BRANCH="$branch" WS_MAIN_CLONE="$main_clone" \
+             "$main_clone/.ws-init" pre ); then
+      echo_failure ".ws-init pre failed — aborting worktree creation for $(basename "$main_clone")"
+      return 1
+    fi
+  fi
+
   local main_branch=$(git -C "$main_clone" symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@')
   [[ -z "$main_branch" ]] && main_branch="main"
 
@@ -258,14 +276,14 @@ end)
     echo_success "Symlinked CLAUDE.local.md"
   fi
 
-  # If the repo's main clone has an executable .ws-init hook, run it with the
-  # new worktree as cwd. This lets a repo set itself up per-workspace (ports,
-  # DB, env, …) without the workspace layer knowing anything project-specific.
-  # The hook lives in the main clone (typically git-excluded / private), so it
-  # applies to every worktree without being committed.
+  # The `post` phase of the same .ws-init hook (see the `pre` invocation above).
+  # Runs with the fully set-up worktree as cwd, so a repo can wire up its
+  # per-workspace state (ports, DB, env, …) without the workspace layer knowing
+  # anything project-specific. cwd == WS_DEST here.
   if [[ -x "$main_clone/.ws-init" ]]; then
-    echo_info "Running .ws-init from $(basename "$main_clone")..."
-    ( cd "$dest" && "$main_clone/.ws-init" )
+    echo_info "Running .ws-init post from $(basename "$main_clone")..."
+    ( cd "$dest" && WS_DEST="$dest" WS_BRANCH="$branch" WS_MAIN_CLONE="$main_clone" \
+        "$main_clone/.ws-init" post )
   fi
 }
 
