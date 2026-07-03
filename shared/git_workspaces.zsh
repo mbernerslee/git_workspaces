@@ -287,19 +287,27 @@ end)
   fi
 }
 
-# _ws_create <repo|path> <branch> [--bg] — create a workspace from a repo + branch.
-# Repo-agnostic (the branch is based off origin's default by _ws_setup_worktree,
-# so the clone needn't be on master). Opens and selects the workspace window;
-# with --bg the window is created in the background and not selected.
+# _ws_create <repo|path> <branch> [--bg|--no-window] — create a workspace from
+# a repo + branch. Repo-agnostic (the branch is based off origin's default by
+# _ws_setup_worktree, so the clone needn't be on master). Opens and selects the
+# workspace window; with --bg the window is created in the background and not
+# selected; with --no-window no tmux window is made at all (for headless
+# scratch workspaces no human will ever type into — an idle window on one just
+# looks like abandoned work).
 _ws_create() {
   if [[ -z "$1" || -z "$2" ]]; then
-    echo_failure "Usage: _ws_create <repo|path> <branch> [--bg]"
+    echo_failure "Usage: _ws_create <repo|path> <branch> [--bg|--no-window]"
     return 1
   fi
   local main_clone=$(_ws_resolve_main_clone "$1")
   local branch="$2"
-  local bg=""
-  [[ "$3" == "--bg" ]] && bg=1
+  local bg="" no_window="" arg
+  for arg in "${@:3}"; do
+    case "$arg" in
+      --bg) bg=1 ;;
+      --no-window) no_window=1 ;;
+    esac
+  done
   if [[ ! -e "$main_clone/.git" ]]; then
     echo_failure "No git repo at $main_clone"
     return 1
@@ -315,7 +323,7 @@ _ws_create() {
     echo_failure "Workspace already exists (and is not empty): $workspace"
     return 1
   fi
-  if tmux list-windows -t mob-editor -F '#{window_name}' 2>/dev/null | grep -qx "$short"; then
+  if [[ -z "$no_window" ]] && tmux list-windows -t mob-editor -F '#{window_name}' 2>/dev/null | grep -qx "$short"; then
     echo_failure "Tmux window '$short' already exists in mob-editor"
     return 1
   fi
@@ -325,8 +333,10 @@ _ws_create() {
   _ws_setup_worktree "$main_clone" "$branch" "$workspace/$repo" || { rmdir "$workspace" 2>/dev/null; return 1; }
 
   # Open the workspace window with its pane already in the repo we just made.
-  # With --bg, create it without switching to it.
-  if [[ -n "$bg" ]]; then
+  # With --bg, create it without switching to it; --no-window skips it.
+  if [[ -n "$no_window" ]]; then
+    :
+  elif [[ -n "$bg" ]]; then
     "$_WS_TPC" goto mob-editor "$short" "$workspace/$repo" --bg
   else
     "$_WS_TPC" goto mob-editor "$short" "$workspace/$repo"
@@ -335,7 +345,10 @@ _ws_create() {
 
   echo_success "Workspace ready: $workspace"
   echo_success "Added '$repo' on branch '$branch'"
-  echo_success "Tmux window '$short' created${bg:+ (in background)}"
+  if [[ -z "$no_window" ]]; then
+    echo_success "Tmux window '$short' created${bg:+ (in background)}"
+  fi
+  return 0
 }
 
 # _ws_add <workspace> <repo|path> [repo...] — add repos to a workspace, all on
