@@ -108,15 +108,18 @@ _ws_setup_worktree() {
     return 1
   fi
 
-  # Per-repo workspace setup hook. A single executable .ws-init in the main clone
+  # Per-repo workspace hook. A single executable .ws-init in the main clone
   # (typically git-excluded / private, so it applies to every worktree without
-  # being committed) is invoked TWICE per worktree, with the phase as $1:
-  #   pre  — BEFORE the worktree is created (cwd = main clone; dest not yet made)
-  #   post — AFTER it is fully set up      (cwd = the new worktree == WS_DEST)
-  # The hook defines shell functions `ws_pre` / `ws_post` and dispatches on the
-  # phase, defining only the phase(s) it cares about. Both phases get the same
-  # context via env: WS_DEST / WS_BRANCH / WS_MAIN_CLONE. A non-zero `pre` ABORTS
-  # creation — the pre phase is treated as a precondition.
+  # being committed) is invoked with the phase as $1:
+  #   pre    — BEFORE the worktree is created (cwd = main clone; dest not made)
+  #   post   — AFTER it is fully set up       (cwd = the new worktree == WS_DEST)
+  #   switch — when switching TO the workspace (ws picker; cwd = the worktree).
+  #            Print a directory to stdout to make the tmux panes land there
+  #            instead of the workspace root. See _ws_switch_dir.
+  # The hook defines shell functions `ws_pre` / `ws_post` / `ws_switch` and
+  # dispatches on the phase, defining only the phase(s) it cares about. All
+  # phases get the same context via env: WS_DEST / WS_BRANCH / WS_MAIN_CLONE.
+  # A non-zero `pre` ABORTS creation — the pre phase is a precondition.
   if [[ -x "$main_clone/.ws-init" ]]; then
     echo_info "Running .ws-init pre from $(basename "$main_clone")..."
     if ! ( cd "$main_clone" && WS_DEST="$dest" WS_BRANCH="$branch" WS_MAIN_CLONE="$main_clone" \
@@ -391,12 +394,32 @@ _ws_add() {
   done
 }
 
-# _ws_switch_workspace <workspace-dir> — select its window (creating if missing).
+# Ask a workspace's member repos where a switch should land. Each member's
+# main-clone .ws-init may define a `switch` phase (see _ws_setup_worktree for
+# the hook convention) that prints a directory to stdout; the first member to
+# print an existing directory wins. Falls back to the workspace dir itself.
+_ws_switch_dir() {
+  local workspace="$1" branch member main_clone dir
+  branch=$(_ws_branch "$workspace")
+  for member in "$workspace"/*(/N); do
+    [[ -e "$member/.git" ]] || continue
+    main_clone=$(git -C "$member" worktree list 2>/dev/null | head -1 | awk '{print $1}')
+    [[ -n "$main_clone" && -x "$main_clone/.ws-init" ]] || continue
+    dir=$( cd "$member" && WS_DEST="$member" WS_BRANCH="$branch" WS_MAIN_CLONE="$main_clone" \
+             "$main_clone/.ws-init" switch 2>/dev/null )
+    [[ -n "$dir" && -d "$dir" ]] && { echo "$dir"; return 0; }
+  done
+  echo "$workspace"
+}
+
+# _ws_switch_workspace <workspace-dir> — select its window (creating if
+# missing), landing the panes wherever the members' `switch` hooks point
+# (workspace root if none do).
 _ws_switch_workspace() {
   local workspace="$1"
   [[ -z "$workspace" ]] && { echo_failure "Usage: _ws_switch_workspace <dir>"; return 1; }
   local short=$(basename "$workspace")
-  "$_WS_TPC" new mob-editor "$short" "$workspace"
+  "$_WS_TPC" goto mob-editor "$short" "$(_ws_switch_dir "$workspace")"
   "$_WS_TPC" select mob-editor "$short"
 }
 
