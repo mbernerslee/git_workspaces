@@ -99,7 +99,8 @@ _ws_short_name() {
 # Add a worktree for one repo into a workspace.
 #   _ws_setup_worktree <main_clone> <branch> <dest>
 # Resolves the branch (remote / local / new-from-master), copies build
-# artifacts, rewrites Mix manifests for the new path, symlinks env files.
+# artifacts, restores tracked-file mtimes, symlinks env files. (Mix-manifest
+# cwd rewriting was retired — ploy-server sets elixirc_options: [check_cwd: false].)
 _ws_setup_worktree() {
   local main_clone="$1" branch="$2" dest="$3"
 
@@ -210,47 +211,54 @@ _ws_setup_worktree() {
   # own recorded mtimes plus per-source content digests — so there is nothing
   # to gain by making artifacts "newer", only this regression to cause.
 
-  # Mix bakes the absolute project path into _build/**/.mix/compile.elixir (as
-  # the manifest cwd / cache_key). On the next `mix compile`, Mix compares that
-  # stored path against File.cwd!(); a mismatch forces a FULL recompile,
-  # regardless of mtimes. Since the worktree lives at a new path, rewrite the
-  # old root prefix to the new one in every manifest term so the copied build
-  # is valid here. (The walk is version-agnostic: 1.19.0 embeds the path in the
-  # cache_key tuple, 1.19.5 stores it as a standalone field.)
-  if [[ -d "$dest/_build" ]] && command -v elixir >/dev/null 2>&1; then
-    echo_info "Rewriting Mix build manifests for new path..."
-    GWTC_OLD_ROOT="$main_clone" GWTC_NEW_ROOT="$dest" elixir -e '
-defmodule GwtcFix do
-  def walk(t, o, n) when is_tuple(t), do: t |> Tuple.to_list() |> Enum.map(&walk(&1, o, n)) |> List.to_tuple()
-  def walk(l, o, n) when is_list(l), do: Enum.map(l, &walk(&1, o, n))
-  def walk(m, o, n) when is_map(m), do: :maps.map(fn _k, v -> walk(v, o, n) end, m)
-  def walk(b, o, n) when is_binary(b) do
-    cond do
-      not String.valid?(b) -> b
-      b == o -> n
-      String.starts_with?(b, o <> "/") -> n <> binary_part(b, byte_size(o), byte_size(b) - byte_size(o))
-      true -> b
-    end
-  end
-  def walk(x, _, _), do: x
-end
-
-old = System.fetch_env!("GWTC_OLD_ROOT")
-new = System.fetch_env!("GWTC_NEW_ROOT")
-
-Path.join(new, "_build/**/.mix/compile.elixir")
-|> Path.wildcard(match_dot: true)
-|> Enum.each(fn path ->
-  try do
-    term = path |> File.read!() |> :erlang.binary_to_term()
-    rewritten = GwtcFix.walk(term, old, new)
-    if rewritten != term, do: File.write!(path, :erlang.term_to_binary(rewritten, [:compressed]))
-  rescue
-    _ -> :ok
-  end
-end)
-' && echo_success "Mix manifests rewritten" || echo_failure "Manifest rewrite failed (a recompile may be needed)"
-  fi
+  # DISABLED 2026-07-20: manifest cwd rewriting is obsolete for ploy-server.
+  # Mix bakes the absolute project path into _build/**/.mix/compile.elixir and
+  # a mismatch vs File.cwd!() used to force a FULL recompile, so this block
+  # rewrote the old root prefix to the new one in every manifest term. Since
+  # ploy-server PR #2735 set `elixirc_options: [check_cwd: false]` in mix.exs
+  # (Elixir >= 1.19.2 feature), Mix skips that cwd check entirely and the
+  # copied _build is reused as-is — verified: a relocated clone compiles 0
+  # files without this rewrite. Kept commented out in case a future Elixir
+  # repo WITHOUT check_cwd: false needs warm relocation; prefer adding the
+  # mix.exs option to that repo instead of re-enabling this.
+  # NOTE: the "Restoring file mtimes" step above is NOT obsolete — the
+  # config-staleness check (mix.exs / config/*.exs mtimes vs manifest) still
+  # fires independently of check_cwd; verified: touching them to "now" forces
+  # a ~3.3k-file recompile even with the flag on.
+  # if [[ -d "$dest/_build" ]] && command -v elixir >/dev/null 2>&1; then
+  #   echo_info "Rewriting Mix build manifests for new path..."
+  #   GWTC_OLD_ROOT="$main_clone" GWTC_NEW_ROOT="$dest" elixir -e '
+# defmodule GwtcFix do
+#   def walk(t, o, n) when is_tuple(t), do: t |> Tuple.to_list() |> Enum.map(&walk(&1, o, n)) |> List.to_tuple()
+#   def walk(l, o, n) when is_list(l), do: Enum.map(l, &walk(&1, o, n))
+#   def walk(m, o, n) when is_map(m), do: :maps.map(fn _k, v -> walk(v, o, n) end, m)
+#   def walk(b, o, n) when is_binary(b) do
+#     cond do
+#       not String.valid?(b) -> b
+#       b == o -> n
+#       String.starts_with?(b, o <> "/") -> n <> binary_part(b, byte_size(o), byte_size(b) - byte_size(o))
+#       true -> b
+#     end
+#   end
+#   def walk(x, _, _), do: x
+# end
+#
+# old = System.fetch_env!("GWTC_OLD_ROOT")
+# new = System.fetch_env!("GWTC_NEW_ROOT")
+#
+# Path.join(new, "_build/**/.mix/compile.elixir")
+# |> Path.wildcard(match_dot: true)
+# |> Enum.each(fn path ->
+#   try do
+#     term = path |> File.read!() |> :erlang.binary_to_term()
+#     rewritten = GwtcFix.walk(term, old, new)
+#     if rewritten != term, do: File.write!(path, :erlang.term_to_binary(rewritten, [:compressed]))
+#   rescue
+#     _ -> :ok
+#   end
+# end)
+# ' && echo_success "Mix manifests rewritten" || echo_failure "Manifest rewrite failed (a recompile may be needed)"
+  # fi
 
   # Symlink env files if they exist in the main clone.
   if [[ -e "$main_clone/.env" ]]; then
