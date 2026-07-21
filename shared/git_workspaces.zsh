@@ -12,6 +12,8 @@
 #                         switch to the new tmux windows)
 #   wsa <repo> [repo...]  add repos to the workspace you're standing in
 #   wsd [name|path]       delete a workspace (worktrees + dir; branches kept)
+#   wsp [--yes] [--force] purge every workspace with no open tmux window
+#                         (--force includes ones with uncommitted changes)
 #   ws                    TV: workspaces — enter=switch, ctrl-g=drill into repos,
 #                         ctrl-n=new, ctrl-d=delete
 #   wt                    TV: worktrees in the current workspace — enter=switch,
@@ -117,10 +119,14 @@ _ws_setup_worktree() {
   #   switch — when switching TO the workspace (ws picker; cwd = the worktree).
   #            Print a directory to stdout to make the tmux panes land there
   #            instead of the workspace root. See _ws_switch_dir.
-  # The hook defines shell functions `ws_pre` / `ws_post` / `ws_switch` and
-  # dispatches on the phase, defining only the phase(s) it cares about. All
-  # phases get the same context via env: WS_DEST / WS_BRANCH / WS_MAIN_CLONE.
-  # A non-zero `pre` ABORTS creation — the pre phase is a precondition.
+  #   delete — BEFORE the worktree is removed (cwd = the worktree, which still
+  #            exists). Undo per-worktree resources `post` created OUTSIDE the
+  #            workspace dir (cloned DBs, …). Failure warns but never blocks
+  #            deletion. See _ws_delete.
+  # The hook defines shell functions `ws_pre` / `ws_post` / `ws_switch` /
+  # `ws_delete` and dispatches on the phase, defining only the phase(s) it
+  # cares about. All phases get the same context via env: WS_DEST / WS_BRANCH /
+  # WS_MAIN_CLONE. A non-zero `pre` ABORTS creation — it is a precondition.
   if [[ -x "$main_clone/.ws-init" ]]; then
     echo_info "Running .ws-init pre from $(basename "$main_clone")..."
     if ! ( cd "$main_clone" && WS_DEST="$dest" WS_BRANCH="$branch" WS_MAIN_CLONE="$main_clone" \
@@ -442,8 +448,9 @@ _ws_switch_worktree() {
   "$_WS_TPC" select mob-editor "$short"
 }
 
-# _ws_delete <workspace-dir> — remove every member worktree (the branches stay
-# in git), then rm the workspace dir and kill its tmux window.
+# _ws_delete <workspace-dir> — run each member repo's .ws-init `delete` hook,
+# remove every member worktree (the branches stay in git), then rm the
+# workspace dir and kill its tmux window.
 _ws_delete() {
   local workspace="$1"
   [[ -z "$workspace" ]] && { echo_failure "Usage: _ws_delete <workspace-dir>"; return 1; }
@@ -459,12 +466,23 @@ _ws_delete() {
   fi
 
   local short=$(basename "$workspace")
-  local member main_worktree
+  local member main_worktree member_branch
 
   for member in "$workspace"/*(/N); do
     [[ -e "$member/.git" ]] || continue
     main_worktree=$(git -C "$member" worktree list 2>/dev/null | head -1 | awk '{print $1}')
     [[ -z "$main_worktree" || "$main_worktree" == "$member" ]] && continue
+
+    # Teardown hook: the `delete` phase of the main clone's .ws-init (see
+    # _ws_setup_worktree). A failed hook must never leave the workspace
+    # half-deleted, so warn and carry on.
+    if [[ -x "$main_worktree/.ws-init" ]]; then
+      member_branch=$(git -C "$member" branch --show-current 2>/dev/null)
+      echo_info "Running .ws-init delete from $(basename "$main_worktree")..."
+      ( cd "$member" && WS_DEST="$member" WS_BRANCH="$member_branch" WS_MAIN_CLONE="$main_worktree" \
+          "$main_worktree/.ws-init" delete ) \
+        || echo_warn ".ws-init delete failed for $member — continuing with deletion"
+    fi
 
     echo_info "Removing worktree $member (branch kept)..."
     git -C "$main_worktree" worktree remove --force "$member" 2>/dev/null
@@ -541,6 +559,77 @@ function wsd() {
   [[ "$cwd" == "$workspace"* ]] && cd "$HOME/src"
 
   _ws_delete "$workspace"
+}
+
+# wsp [--yes] [--force] — purge inactive workspaces: delete every workspace
+# with no open tmux window in the mob pair. A window in EITHER half counts as
+# active (spawned Claudes live in mob-shell, the human in mob-editor).
+# Workspaces with uncommitted changes are skipped unless --force — committed
+# work is safe either way (branches are kept), but dirt would be lost.
+# --yes skips the confirmation, for non-interactive callers; without it a
+# tty-less run safely aborts at the prompt.
+function wsp() {
+  local yes="" force="" arg
+  for arg in "$@"; do
+    case "$arg" in
+      --yes|-y)   yes=1 ;;
+      --force|-f) force=1 ;;
+      *) echo_failure "Usage: wsp [--yes] [--force]"; return 1 ;;
+    esac
+  done
+
+  # With no mob sessions at all (tmux down, fresh boot) EVERY workspace would
+  # look inactive — refuse rather than purge the world.
+  if ! tmux has-session -t mob-editor 2>/dev/null && ! tmux has-session -t mob-shell 2>/dev/null; then
+    echo_failure "No mob-editor/mob-shell tmux sessions running — every workspace would count as inactive. Refusing; use wsd for individual deletes."
+    return 1
+  fi
+  local open_windows=$(
+    { tmux list-windows -t mob-editor -F '#{window_name}' 2>/dev/null
+      tmux list-windows -t mob-shell  -F '#{window_name}' 2>/dev/null; } | sort -u)
+
+  local ws short repo dirty label
+  local -a purge labels skipped
+  for ws in "$WS_ROOT"/*(/N); do
+    short=$(basename "$ws")
+    print -r -- "$open_windows" | grep -qxF "$short" && continue
+    dirty=0
+    for repo in "$ws"/*(/N); do
+      [[ -e "$repo/.git" ]] || continue
+      [[ -n "$(git -C "$repo" status --porcelain 2>/dev/null)" ]] && dirty=1
+    done
+    if (( dirty )) && [[ -z "$force" ]]; then
+      skipped+=("$short")
+      continue
+    fi
+    purge+=("$ws")
+    label="$short"
+    (( dirty )) && label="$short (UNCOMMITTED CHANGES)"
+    labels+=("$label")
+  done
+
+  (( ${#skipped} )) && echo_warn "Skipping ${#skipped} with uncommitted changes (use --force to include): ${(j:, :)skipped}"
+  if (( ${#purge} == 0 )); then
+    echo_success "Nothing to purge — every workspace has an open tmux window."
+    return 0
+  fi
+
+  echo_info "Inactive workspaces to delete (${#purge}):"
+  for label in "${labels[@]}"; do print -r -- "  $label"; done
+  if [[ -z "$yes" ]] && ! _ws_confirm "Delete these ${#purge} workspace(s)?"; then
+    echo_failure "Aborted — nothing deleted."
+    return 1
+  fi
+
+  # Step out first if we're standing inside one of the doomed workspaces.
+  local cwd=$(pwd -P)
+  for ws in "${purge[@]}"; do
+    [[ "$cwd" == "$ws"* ]] && { cd "$HOME/src"; break; }
+  done
+
+  for ws in "${purge[@]}"; do
+    _ws_delete "$ws"
+  done
 }
 
 # ws — TV picker over workspaces (enter drills into a workspace's repos).
