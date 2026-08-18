@@ -584,9 +584,14 @@ function wsp() {
     echo_failure "No mob-editor/mob-shell tmux sessions running — every workspace would count as inactive. Refusing; use wsd for individual deletes."
     return 1
   fi
+  # Duplicated windows are named <base>_<n> (tmux-pair-cmd.sh copy), so index
+  # each name both verbatim and with the _<n> suffix stripped — an open X_2
+  # keeps workspace X alive, while a workspace literally named gpt_2 still
+  # matches its own verbatim window name.
   local open_windows=$(
     { tmux list-windows -t mob-editor -F '#{window_name}' 2>/dev/null
-      tmux list-windows -t mob-shell  -F '#{window_name}' 2>/dev/null; } | sort -u)
+      tmux list-windows -t mob-shell  -F '#{window_name}' 2>/dev/null; } \
+    | awk '{ print; if (sub(/_[0-9]+$/, "")) print }' | sort -u)
 
   local ws short repo dirty label
   local -a purge labels skipped
