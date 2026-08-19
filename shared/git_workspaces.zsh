@@ -47,6 +47,17 @@ _ws_confirm() {
   git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@'
 }
 
+# Copy preserving mtimes (the warm-_build trick depends on them) with COW where
+# the fs has it: APFS clonefile on macOS; GNU cp elsewhere (--reflink=auto uses
+# COW on btrfs/xfs and silently falls back to a plain copy on ext4).
+_ws_copy() {
+  if [[ "$OSTYPE" == darwin* ]]; then
+    cp -Rc "$1" "$2"
+  else
+    cp -a --reflink=auto "$1" "$2"
+  fi
+}
+
 # Resolve a repo argument (bare name under ~/src, or a path) to a main-clone path.
 _ws_resolve_main_clone() {
   local arg="$1"
@@ -178,18 +189,18 @@ _ws_setup_worktree() {
   # follows the dangling symlinks and fails to create files at non-existent targets.
   if [[ -d "$main_clone/deps" ]]; then
     echo_info "Copying deps/..."
-    cp -Rc "$main_clone/deps" "$dest/deps"
+    _ws_copy "$main_clone/deps" "$dest/deps"
   fi
   if [[ -d "$main_clone/_build" ]]; then
     echo_info "Copying _build/..."
-    cp -Rc "$main_clone/_build" "$dest/_build"
+    _ws_copy "$main_clone/_build" "$dest/_build"
   fi
   # JS deps (e.g. ploy-client): node_modules is gitignored so the worktree has
   # none — without it `npm run dev` can't find local bins like vite. Clone-copy
   # it (APFS COW, keeps the relative .bin symlinks intact).
   if [[ -d "$main_clone/node_modules" ]]; then
     echo_info "Copying node_modules/..."
-    cp -Rc "$main_clone/node_modules" "$dest/node_modules"
+    _ws_copy "$main_clone/node_modules" "$dest/node_modules"
   fi
   # git worktree add stamps EVERY checked-out file with the current time, which
   # breaks Elixir's incremental build. On `mix compile`, Mix compares the mtime
@@ -206,7 +217,7 @@ _ws_setup_worktree() {
     [[ -e "$main_clone/$f" && -e "$dest/$f" ]] && touch -r "$main_clone/$f" "$dest/$f"
   done
 
-  # NOTE: do NOT bump _build/deps mtimes to "now". cp -Rc (APFS clone) already
+  # NOTE: do NOT bump _build/deps mtimes to "now". _ws_copy already
   # preserves the main clone's mtimes, which is exactly what the manifest
   # expects. Touching _build forward re-breaks the build: Mix.Project's config
   # set includes _build/<env>/lib/<app>/.mix/compile.lock, so a freshly-touched
@@ -266,29 +277,37 @@ _ws_setup_worktree() {
 # ' && echo_success "Mix manifests rewritten" || echo_failure "Manifest rewrite failed (a recompile may be needed)"
   # fi
 
-  # Symlink env files if they exist in the main clone.
-  if [[ -e "$main_clone/.env" ]]; then
+  # Symlink env files if they exist in the main clone — but NEVER over a file
+  # the worktree already has (a TRACKED .env/.mcp.json/… was checked out by
+  # `worktree add`; ln -sf over it would leave the worktree permanently dirty
+  # with a typechange).
+  if [[ -e "$main_clone/.env" && ! -e "$dest/.env" ]]; then
     ln -sf "$main_clone/.env" "$dest/.env"
     echo_success "Symlinked .env"
   fi
+  if [[ -e "$dest/.envrc" ]]; then
+    # The repo tracks its own .envrc (e.g. one that self-derives per-worktree
+    # isolation) — nothing to symlink, just authorise it for direnv.
+    direnv allow "$dest" 2>/dev/null || true
+    echo_success "Authorised tracked .envrc"
   # Skip the .envrc symlink when the repo has a .ws-init hook — that hook
   # generates its own per-worktree .envrc, so there's nothing to symlink (and
   # writing over a symlink would clobber the main clone's file).
-  if [[ -f "$main_clone/.envrc" && ! -x "$main_clone/.ws-init" ]]; then
+  elif [[ -f "$main_clone/.envrc" && ! -x "$main_clone/.ws-init" ]]; then
     ln -sf "$main_clone/.envrc" "$dest/.envrc"
     echo_success "Symlinked .envrc"
     direnv allow "$dest"
   fi
-  if [[ -f "$main_clone/.mcp.json" ]]; then
+  if [[ -f "$main_clone/.mcp.json" && ! -e "$dest/.mcp.json" ]]; then
     ln -sf "$main_clone/.mcp.json" "$dest/.mcp.json"
     echo_success "Symlinked .mcp.json"
   fi
-  if [[ -f "$main_clone/.claude/settings.local.json" ]]; then
+  if [[ -f "$main_clone/.claude/settings.local.json" && ! -e "$dest/.claude/settings.local.json" ]]; then
     mkdir -p "$dest/.claude"
     ln -sf "$main_clone/.claude/settings.local.json" "$dest/.claude/settings.local.json"
     echo_success "Symlinked .claude/settings.local.json"
   fi
-  if [[ -f "$main_clone/CLAUDE.local.md" ]]; then
+  if [[ -f "$main_clone/CLAUDE.local.md" && ! -e "$dest/CLAUDE.local.md" ]]; then
     ln -sf "$main_clone/CLAUDE.local.md" "$dest/CLAUDE.local.md"
     echo_success "Symlinked CLAUDE.local.md"
   fi
