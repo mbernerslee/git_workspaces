@@ -148,10 +148,37 @@ _ws_setup_worktree() {
   fi
 
   local main_branch=$(git -C "$main_clone" symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@')
+  if [[ -z "$main_branch" ]]; then
+    # No origin/HEAD recorded locally — guess from the usual suspects.
+    local b
+    for b in main master; do
+      if git -C "$main_clone" show-ref --verify --quiet "refs/heads/$b"; then
+        main_branch="$b"
+        break
+      fi
+    done
+  fi
   [[ -z "$main_branch" ]] && main_branch="main"
 
   echo_info "Fetching origin in $(basename "$main_clone")..."
   git -C "$main_clone" fetch origin || { echo_failure "Failed to fetch origin"; return 1; }
+
+  # New branches are based on the LOCAL default branch; whether that branch is
+  # synced first is the per-repo .ws-init `pre` hook's decision (ploy's runs
+  # `git pull`, so team repos still effectively base on origin). Divergence is
+  # warned about so a stale or unpushed base is a visible choice, not a silent
+  # surprise. Repos with no local copy of the default branch fall back to
+  # origin's.
+  local base_ref="origin/$main_branch"
+  if git -C "$main_clone" show-ref --verify --quiet "refs/heads/$main_branch"; then
+    base_ref="$main_branch"
+    if git -C "$main_clone" show-ref --verify --quiet "refs/remotes/origin/$main_branch"; then
+      local behind=$(git -C "$main_clone" rev-list --count "$main_branch..origin/$main_branch" 2>/dev/null)
+      local ahead=$(git -C "$main_clone" rev-list --count "origin/$main_branch..$main_branch" 2>/dev/null)
+      (( behind > 0 )) && echo_warn "⚠ Local $main_branch is $behind commit(s) behind origin/$main_branch — basing the workspace on the stale local branch anyway"
+      (( ahead > 0 )) && echo_info "Local $main_branch has $ahead unpushed commit(s); the workspace will include them"
+    fi
+  fi
 
   echo_info "Creating worktree at $dest..."
   local remote_exists=false local_exists=false
@@ -179,8 +206,8 @@ _ws_setup_worktree() {
     echo_info "Using existing local branch '$branch'..."
     git -C "$main_clone" worktree add "$dest" "$branch" || { echo_failure "Failed to create worktree"; return 1; }
   else
-    echo_info "Creating new branch '$branch' from origin/$main_branch..."
-    git -C "$main_clone" worktree add "$dest" -b "$branch" "origin/$main_branch" || { echo_failure "Failed to create worktree"; return 1; }
+    echo_info "Creating new branch '$branch' from $base_ref..."
+    git -C "$main_clone" worktree add "$dest" -b "$branch" "$base_ref" || { echo_failure "Failed to create worktree"; return 1; }
   fi
 
   # Copy build artifacts if they exist.
