@@ -47,6 +47,17 @@ _ws_confirm() {
   git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@'
 }
 
+# Copy preserving mtimes (the warm-_build trick depends on them) with COW where
+# the fs has it: APFS clonefile on macOS; GNU cp elsewhere (--reflink=auto uses
+# COW on btrfs/xfs and silently falls back to a plain copy on ext4).
+_ws_copy() {
+  if [[ "$OSTYPE" == darwin* ]]; then
+    cp -Rc "$1" "$2"
+  else
+    cp -a --reflink=auto "$1" "$2"
+  fi
+}
+
 # Resolve a repo argument (bare name under ~/src, or a path) to a main-clone path.
 _ws_resolve_main_clone() {
   local arg="$1"
@@ -137,10 +148,37 @@ _ws_setup_worktree() {
   fi
 
   local main_branch=$(git -C "$main_clone" symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@')
+  if [[ -z "$main_branch" ]]; then
+    # No origin/HEAD recorded locally — guess from the usual suspects.
+    local b
+    for b in main master; do
+      if git -C "$main_clone" show-ref --verify --quiet "refs/heads/$b"; then
+        main_branch="$b"
+        break
+      fi
+    done
+  fi
   [[ -z "$main_branch" ]] && main_branch="main"
 
   echo_info "Fetching origin in $(basename "$main_clone")..."
   git -C "$main_clone" fetch origin || { echo_failure "Failed to fetch origin"; return 1; }
+
+  # New branches are based on the LOCAL default branch; whether that branch is
+  # synced first is the per-repo .ws-init `pre` hook's decision (ploy's runs
+  # `git pull`, so team repos still effectively base on origin). Divergence is
+  # warned about so a stale or unpushed base is a visible choice, not a silent
+  # surprise. Repos with no local copy of the default branch fall back to
+  # origin's.
+  local base_ref="origin/$main_branch"
+  if git -C "$main_clone" show-ref --verify --quiet "refs/heads/$main_branch"; then
+    base_ref="$main_branch"
+    if git -C "$main_clone" show-ref --verify --quiet "refs/remotes/origin/$main_branch"; then
+      local behind=$(git -C "$main_clone" rev-list --count "$main_branch..origin/$main_branch" 2>/dev/null)
+      local ahead=$(git -C "$main_clone" rev-list --count "origin/$main_branch..$main_branch" 2>/dev/null)
+      (( behind > 0 )) && echo_warn "⚠ Local $main_branch is $behind commit(s) behind origin/$main_branch — basing the workspace on the stale local branch anyway"
+      (( ahead > 0 )) && echo_info "Local $main_branch has $ahead unpushed commit(s); the workspace will include them"
+    fi
+  fi
 
   echo_info "Creating worktree at $dest..."
   local remote_exists=false local_exists=false
@@ -168,8 +206,8 @@ _ws_setup_worktree() {
     echo_info "Using existing local branch '$branch'..."
     git -C "$main_clone" worktree add "$dest" "$branch" || { echo_failure "Failed to create worktree"; return 1; }
   else
-    echo_info "Creating new branch '$branch' from origin/$main_branch..."
-    git -C "$main_clone" worktree add "$dest" -b "$branch" "origin/$main_branch" || { echo_failure "Failed to create worktree"; return 1; }
+    echo_info "Creating new branch '$branch' from $base_ref..."
+    git -C "$main_clone" worktree add "$dest" -b "$branch" "$base_ref" || { echo_failure "Failed to create worktree"; return 1; }
   fi
 
   # Copy build artifacts if they exist.
@@ -178,18 +216,18 @@ _ws_setup_worktree() {
   # follows the dangling symlinks and fails to create files at non-existent targets.
   if [[ -d "$main_clone/deps" ]]; then
     echo_info "Copying deps/..."
-    cp -Rc "$main_clone/deps" "$dest/deps"
+    _ws_copy "$main_clone/deps" "$dest/deps"
   fi
   if [[ -d "$main_clone/_build" ]]; then
     echo_info "Copying _build/..."
-    cp -Rc "$main_clone/_build" "$dest/_build"
+    _ws_copy "$main_clone/_build" "$dest/_build"
   fi
   # JS deps (e.g. ploy-client): node_modules is gitignored so the worktree has
   # none — without it `npm run dev` can't find local bins like vite. Clone-copy
   # it (APFS COW, keeps the relative .bin symlinks intact).
   if [[ -d "$main_clone/node_modules" ]]; then
     echo_info "Copying node_modules/..."
-    cp -Rc "$main_clone/node_modules" "$dest/node_modules"
+    _ws_copy "$main_clone/node_modules" "$dest/node_modules"
   fi
   # git worktree add stamps EVERY checked-out file with the current time, which
   # breaks Elixir's incremental build. On `mix compile`, Mix compares the mtime
@@ -206,7 +244,7 @@ _ws_setup_worktree() {
     [[ -e "$main_clone/$f" && -e "$dest/$f" ]] && touch -r "$main_clone/$f" "$dest/$f"
   done
 
-  # NOTE: do NOT bump _build/deps mtimes to "now". cp -Rc (APFS clone) already
+  # NOTE: do NOT bump _build/deps mtimes to "now". _ws_copy already
   # preserves the main clone's mtimes, which is exactly what the manifest
   # expects. Touching _build forward re-breaks the build: Mix.Project's config
   # set includes _build/<env>/lib/<app>/.mix/compile.lock, so a freshly-touched
@@ -266,29 +304,37 @@ _ws_setup_worktree() {
 # ' && echo_success "Mix manifests rewritten" || echo_failure "Manifest rewrite failed (a recompile may be needed)"
   # fi
 
-  # Symlink env files if they exist in the main clone.
-  if [[ -e "$main_clone/.env" ]]; then
+  # Symlink env files if they exist in the main clone — but NEVER over a file
+  # the worktree already has (a TRACKED .env/.mcp.json/… was checked out by
+  # `worktree add`; ln -sf over it would leave the worktree permanently dirty
+  # with a typechange).
+  if [[ -e "$main_clone/.env" && ! -e "$dest/.env" ]]; then
     ln -sf "$main_clone/.env" "$dest/.env"
     echo_success "Symlinked .env"
   fi
+  if [[ -e "$dest/.envrc" ]]; then
+    # The repo tracks its own .envrc (e.g. one that self-derives per-worktree
+    # isolation) — nothing to symlink, just authorise it for direnv.
+    direnv allow "$dest" 2>/dev/null || true
+    echo_success "Authorised tracked .envrc"
   # Skip the .envrc symlink when the repo has a .ws-init hook — that hook
   # generates its own per-worktree .envrc, so there's nothing to symlink (and
   # writing over a symlink would clobber the main clone's file).
-  if [[ -f "$main_clone/.envrc" && ! -x "$main_clone/.ws-init" ]]; then
+  elif [[ -f "$main_clone/.envrc" && ! -x "$main_clone/.ws-init" ]]; then
     ln -sf "$main_clone/.envrc" "$dest/.envrc"
     echo_success "Symlinked .envrc"
     direnv allow "$dest"
   fi
-  if [[ -f "$main_clone/.mcp.json" ]]; then
+  if [[ -f "$main_clone/.mcp.json" && ! -e "$dest/.mcp.json" ]]; then
     ln -sf "$main_clone/.mcp.json" "$dest/.mcp.json"
     echo_success "Symlinked .mcp.json"
   fi
-  if [[ -f "$main_clone/.claude/settings.local.json" ]]; then
+  if [[ -f "$main_clone/.claude/settings.local.json" && ! -e "$dest/.claude/settings.local.json" ]]; then
     mkdir -p "$dest/.claude"
     ln -sf "$main_clone/.claude/settings.local.json" "$dest/.claude/settings.local.json"
     echo_success "Symlinked .claude/settings.local.json"
   fi
-  if [[ -f "$main_clone/CLAUDE.local.md" ]]; then
+  if [[ -f "$main_clone/CLAUDE.local.md" && ! -e "$dest/CLAUDE.local.md" ]]; then
     ln -sf "$main_clone/CLAUDE.local.md" "$dest/CLAUDE.local.md"
     echo_success "Symlinked CLAUDE.local.md"
   fi
@@ -584,9 +630,14 @@ function wsp() {
     echo_failure "No mob-editor/mob-shell tmux sessions running — every workspace would count as inactive. Refusing; use wsd for individual deletes."
     return 1
   fi
+  # Duplicated windows are named <base>_<n> (tmux-pair-cmd.sh copy), so index
+  # each name both verbatim and with the _<n> suffix stripped — an open X_2
+  # keeps workspace X alive, while a workspace literally named gpt_2 still
+  # matches its own verbatim window name.
   local open_windows=$(
     { tmux list-windows -t mob-editor -F '#{window_name}' 2>/dev/null
-      tmux list-windows -t mob-shell  -F '#{window_name}' 2>/dev/null; } | sort -u)
+      tmux list-windows -t mob-shell  -F '#{window_name}' 2>/dev/null; } \
+    | awk '{ print; if (sub(/_[0-9]+$/, "")) print }' | sort -u)
 
   local ws short repo dirty label
   local -a purge labels skipped
