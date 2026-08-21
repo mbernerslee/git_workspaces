@@ -537,6 +537,11 @@ _ws_delete() {
   # Remove whatever remains of the workspace dir, then the tmux window.
   [[ -d "$workspace" ]] && rm -rf "$workspace"
   "$_WS_TPC" kill mob-editor "$short"
+
+  # Free every port the workspace leased (any repo's .ws-init reserves under
+  # the owner key "ws:<name>" — see scripts/ports). Generic: the workspace layer
+  # only knows the owner key, never which ports a repo wanted.
+  [[ -x "$HOME/src/dev_setup/scripts/ports" ]] && "$HOME/src/dev_setup/scripts/ports" release "ws:$short" >/dev/null 2>&1
   echo_success "Deleted workspace: $workspace"
 }
 
