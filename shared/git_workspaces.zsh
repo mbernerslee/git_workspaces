@@ -498,8 +498,9 @@ _ws_switch_worktree() {
 # remove every member worktree (the branches stay in git), then rm the
 # workspace dir and kill its tmux window.
 _ws_delete() {
-  local workspace="$1"
-  [[ -z "$workspace" ]] && { echo_failure "Usage: _ws_delete <workspace-dir>"; return 1; }
+  local workspace="$1" force=""
+  [[ "${2:-}" == "--force" ]] && force=1
+  [[ -z "$workspace" ]] && { echo_failure "Usage: _ws_delete <workspace-dir> [--force]"; return 1; }
 
   # Safety: only ever operate under WS_ROOT.
   case "$workspace" in
@@ -512,6 +513,22 @@ _ws_delete() {
   fi
 
   local short=$(basename "$workspace")
+
+  # Open PRs: deleting the workspace would orphan them (their branches live
+  # only in this worktree's reflog — see scripts/prs). Refuse unless --force;
+  # if PR state is unknown (gh down, no cache) warn and carry on.
+  local prs="$HOME/src/dev_setup/scripts/prs" prs_rc=0
+  if [[ -z "$force" && -x "$prs" ]]; then
+    "$prs" open-count "$short" >/dev/null 2>&1; prs_rc=$?
+    if (( prs_rc == 1 )); then
+      echo_failure "Workspace $short still has open PRs — merge/close them, 'prs ignore' them, or use --force:"
+      "$prs" list --ws "$short" --offline 2>/dev/null
+      return 1
+    elif (( prs_rc == 2 )); then
+      echo_warn "PR state for $short unknown (gh unavailable) — proceeding"
+    fi
+  fi
+
   local member main_worktree member_branch
 
   for member in "$workspace"/*(/N); do
@@ -597,17 +614,23 @@ function wsa() {
 
 # wsd [name|path] — delete a workspace (defaults to the one you're standing in).
 function wsd() {
-  local workspace
-  if [[ -n "$1" ]]; then
-    if [[ "$1" == */* || "$1" == "~"* ]]; then
-      workspace="${1/#\~/$HOME}"
+  local workspace force="" arg name=""
+  for arg in "$@"; do
+    case "$arg" in
+      --force|-f) force=1 ;;
+      *) name="$arg" ;;
+    esac
+  done
+  if [[ -n "$name" ]]; then
+    if [[ "$name" == */* || "$name" == "~"* ]]; then
+      workspace="${name/#\~/$HOME}"
     else
-      workspace="$WS_ROOT/$1"
+      workspace="$WS_ROOT/$name"
     fi
   else
     workspace=$(_ws_from_pwd)
     if [[ -z "$workspace" ]]; then
-      echo_failure "Not inside a workspace; pass one: wsd <name>"
+      echo_failure "Not inside a workspace; pass one: wsd [--force] <name>"
       return 1
     fi
   fi
@@ -616,14 +639,15 @@ function wsd() {
   local cwd=$(pwd -P)
   [[ "$cwd" == "$workspace"* ]] && cd "$HOME/src"
 
-  _ws_delete "$workspace"
+  _ws_delete "$workspace" ${force:+--force}
 }
 
 # wsp [--yes] [--force] — purge inactive workspaces: delete every workspace
 # with no open tmux window in the mob pair. A window in EITHER half counts as
 # active (spawned Claudes live in mob-shell, the human in mob-editor).
-# Workspaces with uncommitted changes are skipped unless --force — committed
-# work is safe either way (branches are kept), but dirt would be lost.
+# Workspaces with uncommitted changes or open PRs are skipped unless --force —
+# committed work is safe either way (branches are kept), but dirt or an open
+# PR's only-copy branch would be lost.
 # --yes skips the confirmation, for non-interactive callers; without it a
 # tty-less run safely aborts at the prompt.
 function wsp() {
@@ -652,7 +676,7 @@ function wsp() {
     | awk '{ print; if (sub(/_[0-9]+$/, "")) print }' | sort -u)
 
   local ws short repo dirty label
-  local -a purge labels skipped
+  local -a purge labels skipped skipped_prs
   for ws in "$WS_ROOT"/*(/N); do
     short=$(basename "$ws")
     print -r -- "$open_windows" | grep -qxF "$short" && continue
@@ -661,6 +685,15 @@ function wsp() {
       [[ -e "$repo/.git" ]] || continue
       [[ -n "$(git -C "$repo" status --porcelain 2>/dev/null)" ]] && dirty=1
     done
+    local open_prs=0
+    if [[ -x "$HOME/src/dev_setup/scripts/prs" ]]; then
+      "$HOME/src/dev_setup/scripts/prs" open-count "$short" >/dev/null 2>&1
+      (( $? == 1 )) && open_prs=1
+    fi
+    if (( open_prs )) && [[ -z "$force" ]]; then
+      skipped_prs+=("$short")
+      continue
+    fi
     if (( dirty )) && [[ -z "$force" ]]; then
       skipped+=("$short")
       continue
@@ -672,6 +705,7 @@ function wsp() {
   done
 
   (( ${#skipped} )) && echo_warn "Skipping ${#skipped} with uncommitted changes (use --force to include): ${(j:, :)skipped}"
+  (( ${#skipped_prs} )) && echo_warn "Skipping ${#skipped_prs} with open PRs (use --force to include): ${(j:, :)skipped_prs}"
   if (( ${#purge} == 0 )); then
     echo_success "Nothing to purge — every workspace has an open tmux window."
     return 0
@@ -691,7 +725,7 @@ function wsp() {
   done
 
   for ws in "${purge[@]}"; do
-    _ws_delete "$ws"
+    _ws_delete "$ws" ${force:+--force}
   done
 }
 
