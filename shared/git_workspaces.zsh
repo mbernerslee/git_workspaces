@@ -524,8 +524,8 @@ _ws_delete() {
       echo_failure "Workspace $short still has open PRs — merge/close them, 'prs ignore' them, or use --force:"
       "$prs" list --ws "$short" --offline 2>/dev/null
       return 1
-    elif (( prs_rc == 2 )); then
-      echo_warn "PR state for $short unknown (gh unavailable) — proceeding"
+    elif (( prs_rc != 0 )); then
+      echo_warn "PR state for $short unknown (prs rc $prs_rc) — proceeding"
     fi
   fi
 
