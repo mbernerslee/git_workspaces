@@ -89,7 +89,7 @@ _ws_branch() {
 }
 
 _ws_short_name() {
-  local branch="$1"
+  local branch="${1//\//-}"  # slashes would nest the workspace dir under WS_ROOT
   local max=25
   # Strip plo-XXXX- prefix (Linear ticket IDs)
   local stripped=$(echo "$branch" | sed 's/^plo-[0-9]*-//')
@@ -534,15 +534,22 @@ _ws_delete() {
     git -C "$main_worktree" worktree remove --force "$member" 2>/dev/null
   done
 
-  # Remove whatever remains of the workspace dir, then the tmux window.
+  # Remove whatever remains of the workspace dir.
   [[ -d "$workspace" ]] && rm -rf "$workspace"
-  "$_WS_TPC" kill mob-editor "$short"
 
   # Free every port the workspace leased (any repo's .ws-init reserves under
   # the owner key "ws:<name>" — see scripts/ports). Generic: the workspace layer
   # only knows the owner key, never which ports a repo wanted.
-  [[ -x "$HOME/src/dev_setup/scripts/ports" ]] && "$HOME/src/dev_setup/scripts/ports" release "ws:$short" >/dev/null 2>&1
+  if [[ -x "$HOME/src/dev_setup/scripts/ports" ]]; then
+    "$HOME/src/dev_setup/scripts/ports" release "ws:$short" >/dev/null \
+      || echo_warn "Failed to release ports for ws:$short — run 'ports release ws:$short'"
+  fi
   echo_success "Deleted workspace: $workspace"
+
+  # LAST, always: killing the window SIGHUPs this very shell when wsd was run
+  # from inside the workspace's own window. Anything below here would silently
+  # not run — which is exactly how leases used to leak.
+  "$_WS_TPC" kill mob-editor "$short"
 }
 
 # wsc [--bg] <branch> — create a workspace from the repo in the current directory.
