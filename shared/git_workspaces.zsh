@@ -71,7 +71,9 @@ _ws_resolve_main_clone() {
 # Echo the workspace dir that the current directory lives in (empty if none).
 _ws_from_pwd() {
   local cwd=$(pwd -P)
-  local root=$(cd "$WS_ROOT" 2>/dev/null && pwd -P)
+  # -q: don't fire chpwd hooks from this subshell — _ws_export_name is one of
+  # them and calls back here, which would recurse without bound.
+  local root=$(cd -q "$WS_ROOT" 2>/dev/null && pwd -P)
   [[ -z "$root" || "$cwd" != "$root"/* ]] && return 1
   local rest="${cwd#$root/}"
   echo "$root/${rest%%/*}"
@@ -762,3 +764,14 @@ if (( $+functions[compdef] )); then
   compdef _ws_src_repos wsa
   compdef _ws_workspaces wsd
 fi
+
+# WS_NAME=<workspace short name> is exported whenever the shell is inside a
+# workspace (and unset when it leaves), so per-workspace tooling can find its
+# identity without sniffing $PWD — scripts/ports uses it as the default owner
+# (ws:$WS_NAME) for every command when no owner is given.
+_ws_export_name() {
+  local ws=$(_ws_from_pwd)
+  if [[ -n "$ws" ]]; then export WS_NAME="${ws:t}"; else unset WS_NAME; fi
+}
+autoload -Uz add-zsh-hook && add-zsh-hook chpwd _ws_export_name
+_ws_export_name
