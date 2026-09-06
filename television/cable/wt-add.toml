@@ -3,7 +3,7 @@ name = "wt-add"
 description = "Pick a repo from ~/src to add to the current workspace"
 
 [source]
-command = "~/src/dev_setup/scripts/src-repos-list.sh \"$(cat /tmp/tv-ws 2>/dev/null)\""
+command = "~/src/dev_setup/scripts/src-repos-list.sh \"$(cat \"${WS_STATE:-/tmp/tv-ws}\" 2>/dev/null)\""
 
 [preview]
 command = "git -C '{}' log --oneline -15 2>/dev/null"

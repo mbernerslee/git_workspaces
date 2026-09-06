@@ -2,16 +2,16 @@
 # ws-repos — discover and manage the repos in the CURRENT workspace.
 #
 # Built so an agent (Claude) running inside a workspace can tell which repos are
-# already worktree'd here vs. which main clones under ~/src it could pull in, and
+# already worktree'd here vs. which main clones under $WS_SRC_ROOT it could pull in, and
 # add them — without the interactive `wsa` (no tmux/cd side effects). Reuses the
-# workspace internals in shared/git_workspaces.zsh, so it stays project-agnostic.
+# workspace internals in git_workspaces.zsh, so it stays project-agnostic.
 #
-#   ws-repos.sh [list]          # show in-workspace repos + what's addable from ~/src
+#   ws-repos.sh [list]          # show in-workspace repos + what's addable from $WS_SRC_ROOT
 #   ws-repos.sh add <repo>...   # worktree main clone(s) into this workspace (this branch)
 #
-# Must be run from inside a workspace (a dir under ~/src/workspaces/<name>/...).
+# Must be run from inside a workspace (a dir under $WS_ROOT/<name>/...).
 set -u
-source "$HOME/src/dev_setup/shared/git_workspaces.zsh"
+source "${0:A:h}/../shared/git_workspaces.zsh"
 
 workspace="$(_ws_from_pwd)" || true
 if [[ -z "${workspace:-}" ]]; then
@@ -40,9 +40,9 @@ case "$cmd" in
       print -r -- "  (none)"
     fi
     print -r --
-    print -r -- "Available to add from ~/src:"
+    print -r -- "Available to add from $WS_SRC_ROOT:"
     local found=0 name
-    for d in "$HOME"/src/*(/N); do
+    for d in "$WS_SRC_ROOT"/*(/N); do
       name="${d:t}"
       [[ "$name" == "${WS_ROOT:t}" ]] && continue   # skip the workspaces dir itself
       [[ -e "$d/.git" ]] || continue                # only real git repos

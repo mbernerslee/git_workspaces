@@ -3,7 +3,7 @@ name = "ws"
 description = "Browse and manage workspaces (multi-repo git worktrees)"
 
 [source]
-command = "ls -1d ~/src/workspaces/*/ 2>/dev/null | sed 's:/*$::'"
+command = "ls -1d \"${WS_ROOT:-$HOME/src/workspaces}\"/*/ 2>/dev/null | sed 's:/*$::'"
 
 [preview]
 command = "for r in '{}'/*/; do [ -d \"$r\" ] || continue; b=$(git -C \"$r\" branch --show-current 2>/dev/null); echo \"▸ $(basename \"$r\")  [$b]\"; git -C \"$r\" status -s 2>/dev/null | sed 's/^/    /'; done"
@@ -21,7 +21,7 @@ mode = "execute"
 
 [actions.repos]
 description = "Drill into this workspace's repos / worktrees"
-command = "echo '{}' > /tmp/tv-ws && tv wt"
+command = "echo '{}' > \"${WS_STATE:-/tmp/tv-ws}\" && tv wt"
 mode = "execute"
 
 [actions.new]
