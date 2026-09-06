@@ -109,6 +109,14 @@ assert_not_contains "no warning about missing hooks" "$OUT" "hook failed"
 assert_not_contains "…nor a refusal" "$OUT" "hook refused"
 hook pre-create; hook created
 
+echo "== a hook that hits command-not-found is a failure, not a missing hook"
+hook created 'exec no-such-command-zz "$WS_NAME"'
+reset_log
+zws "_ws_create '$WS_SRC_ROOT/repo' cnf"
+assert_eq "create still succeeds" "$RC" 0
+assert_contains "…but warns, with rc 126 not 127" "$OUT" "created hook failed for 'cnf' (rc 126)"
+hook created
+
 echo "== switch"
 hook switch
 reset_log

@@ -30,7 +30,7 @@
 
 export WS_ROOT="${WS_ROOT:-$HOME/src/workspaces}"
 export WS_SRC_ROOT="${WS_SRC_ROOT:-$HOME/src}"
-WS_HOOKS_DIR="${WS_HOOKS_DIR:-$HOME/.config/ws/hooks}"
+export WS_HOOKS_DIR="${WS_HOOKS_DIR:-$HOME/.config/ws/hooks}"
 # tv hands the "current workspace" to the wt channel here. Exported: the tv
 # cables run in tv's child shell and read $WS_STATE.
 export WS_STATE="${WS_STATE:-${XDG_RUNTIME_DIR:-/tmp}/tv-ws}"
@@ -46,7 +46,9 @@ export WS_STATE="${WS_STATE:-${XDG_RUNTIME_DIR:-/tmp}/tv-ws}"
 # it exists and is executable, with the given context vars set for THAT
 # process only (so a shell-exported WS_NAME never leaks into a hook about a
 # different workspace). Runs synchronously in the caller's cwd.
-# Returns 127 when there is no such hook, otherwise the hook's exit status.
+# Returns 127 when there is no such hook, otherwise the hook's exit status —
+# except that a hook which itself died with 127 ("command not found", e.g. a
+# tool missing from PATH) is reported as 126, so it can never pass for "no hook".
 #
 # Hooks and their contract (all optional; context: WS_NAME, WS_DIR, WS_ROOT_DIR,
 # WS_BRANCH, and WS_BG=1 when the caller asked for background):
@@ -61,7 +63,9 @@ _ws_hook() {
   local name="$1"; shift
   local hook="$WS_HOOKS_DIR/$name"
   [[ -x "$hook" ]] || return 127
-  env "$@" "$hook"
+  env "$@" "$hook"; local rc=$?
+  (( rc == 127 )) && rc=126
+  return $rc
 }
 
 # Ask a yes/no question on the tty; return 0 only on an explicit yes. Defaults
