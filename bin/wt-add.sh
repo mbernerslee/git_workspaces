@@ -2,7 +2,7 @@
 # tv action: add the picked repo as a worktree to the current workspace (from
 # WS_STATE, falling back to $PWD).
 
-source "${0:A:h}/../shared/git_workspaces.zsh"
+source "${0:A:h}/../git_workspaces.zsh"
 
 if [[ -z "$1" ]]; then
   echo_failure "No repo given"

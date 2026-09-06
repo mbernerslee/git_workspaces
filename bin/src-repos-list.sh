@@ -3,7 +3,7 @@
 # Excludes the workspaces dir itself. If a workspace path is given as $1, also
 # excludes repos already present in that workspace.
 
-source "${0:A:h}/../shared/git_workspaces.zsh"
+source "${0:A:h}/../git_workspaces.zsh"
 
 typeset -a present
 ws="$1"

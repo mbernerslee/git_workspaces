@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Tests for the user-hook contract of shared/git_workspaces.zsh.
+# Tests for the user-hook contract of git_workspaces.zsh.
 # Run: tests/ws_hooks_test.sh   (exit 1 on any failure)
 set -u
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-WSZSH="${WSZSH:-$here/../shared/git_workspaces.zsh}"
+WSZSH="${WSZSH:-$here/../git_workspaces.zsh}"
 
 T="$(mktemp -d "${TMPDIR:-/tmp}/ws-hooks-test.XXXXXX")"
 trap 'rm -rf "$T"' EXIT

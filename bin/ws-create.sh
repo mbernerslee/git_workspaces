@@ -1,7 +1,7 @@
 #!/usr/bin/env zsh
 # tv action: create a new workspace from the picked repo, prompting for a branch.
 
-source "${0:A:h}/../shared/git_workspaces.zsh"
+source "${0:A:h}/../git_workspaces.zsh"
 
 repo="$1"
 if [[ -z "$repo" ]]; then

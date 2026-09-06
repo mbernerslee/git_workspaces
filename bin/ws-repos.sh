@@ -3,7 +3,7 @@
 #
 # Built so an agent (Claude) running inside a workspace can tell which repos are
 # already worktree'd here vs. which main clones under $WS_SRC_ROOT it could pull in, and
-# add them — without the interactive `wsa` (no tmux/cd side effects). Reuses the
+# add them — without the interactive `wsa` (no presentation/cd side effects). Reuses the
 # workspace internals in git_workspaces.zsh, so it stays project-agnostic.
 #
 #   ws-repos.sh [list]          # show in-workspace repos + what's addable from $WS_SRC_ROOT
@@ -11,7 +11,7 @@
 #
 # Must be run from inside a workspace (a dir under $WS_ROOT/<name>/...).
 set -u
-source "${0:A:h}/../shared/git_workspaces.zsh"
+source "${0:A:h}/../git_workspaces.zsh"
 
 workspace="$(_ws_from_pwd)" || true
 if [[ -z "${workspace:-}" ]]; then

@@ -15,8 +15,8 @@ ctrl-n = "actions:new"
 ctrl-d = "actions:delete"
 
 [actions.switch]
-description = "Switch to this workspace's tmux window"
-command = "~/src/dev_setup/scripts/ws-switch.sh '{}'"
+description = "Switch to this workspace (runs the switch hook)"
+command = "ws-switch.sh '{}'"
 mode = "execute"
 
 [actions.repos]
@@ -31,5 +31,5 @@ mode = "execute"
 
 [actions.delete]
 description = "Delete the workspace (worktrees + dir; branches kept)"
-command = "~/src/dev_setup/scripts/ws-delete.sh '{}'"
+command = "ws-delete.sh '{}'"
 mode = "execute"
