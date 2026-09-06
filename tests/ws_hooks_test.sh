@@ -105,7 +105,8 @@ unhook pre-create; unhook created
 reset_log
 zws "_ws_create '$WS_SRC_ROOT/repo' nohooks"
 assert_eq "create without hooks rc" "$RC" 0
-assert_not_contains "no warning about missing hooks" "$OUT" "hook"
+assert_not_contains "no warning about missing hooks" "$OUT" "hook failed"
+assert_not_contains "…nor a refusal" "$OUT" "hook refused"
 hook pre-create; hook created
 
 echo "== switch"
@@ -198,8 +199,9 @@ zws "wsp --yes"
 assert_eq "wsp rc" "$RC" 0
 assert_dir "active workspace kept" "$WS_ROOT/aaa/repo"
 assert_no_dir "inactive purged" "$WS_ROOT/ccc"
-assert_contains "purge ran pre-delete for the candidate" "$(hook_line pre-delete)" "WS_NAME=ccc "
-assert_contains "…and deleted" "$(hook_line deleted)" "WS_NAME=ccc "
+assert_contains "purge ran pre-delete for the candidate" "$(cat "$HOOK_LOG")" "pre-delete WS_NAME=ccc "
+assert_contains "…and deleted" "$(cat "$HOOK_LOG")" "deleted WS_NAME=ccc "
+assert_not_contains "…but never touched the active one" "$(cat "$HOOK_LOG")" "WS_NAME=aaa "
 
 zws "_ws_create '$WS_SRC_ROOT/repo' ddd --no-window"
 hook pre-delete '[ "$WS_NAME" = ddd ] && exit 1; exit 0'

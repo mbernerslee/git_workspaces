@@ -1,19 +1,22 @@
-# Workspaces (multi-repo git worktrees) + Tmux
+# Workspaces (multi-repo git worktrees)
 #
 # A "workspace" groups per-repo worktrees you work on together under
-#   ~/src/workspaces/<short>/<repo>/
+#   $WS_ROOT/<short>/<repo>/            (default ~/src/workspaces)
 # The workspace IS a branch: every repo in it uses the same branch name.
-# Main clones live at ~/src/<repo> and are never touched. There is one tmux
-# window per workspace (in the mob-editor/mob-shell pair), rooted at the
-# workspace; switching a worktree just cd's that window's pane into the repo.
+# Main clones live at $WS_SRC_ROOT/<repo> (default ~/src) and are never touched.
+#
+# How a workspace is *presented* (a tmux window, a herdr workspace, nothing) is
+# not this file's business: at each lifecycle point it runs an optional user
+# hook from $WS_HOOKS_DIR (default ~/.config/ws/hooks) — see _ws_hook below.
 #
 # Commands:
-#   wsc [--bg] <branch>   create a workspace from the current repo (--bg: don't
-#                         switch to the new tmux windows)
+#   wsc [--bg] <branch>   create a workspace from the current repo (--bg: tell
+#                         the `created` hook not to switch to it)
 #   wsa <repo> [repo...]  add repos to the workspace you're standing in
 #   wsd [name|path]       delete a workspace (worktrees + dir; branches kept)
-#   wsp [--yes] [--force] purge every workspace with no open tmux window
-#                         (--force includes ones with uncommitted changes)
+#   wsp [--yes] [--force] purge every workspace the `active` hook doesn't list
+#                         (--force includes ones with uncommitted changes or a
+#                         refusing pre-delete hook)
 #   ws                    TV: workspaces — enter=switch, ctrl-g=drill into repos,
 #                         ctrl-n=new, ctrl-d=delete
 #   wt                    TV: worktrees in the current workspace — enter=switch,
@@ -21,13 +24,16 @@
 #
 # (ctrl-g avoids the built-in ctrl-l=toggle_layout that shadowed the drill key.)
 #
-# Sourced from shared/zshrc (where the real echo_*/master_branch live) AND
-# directly by the tv helper scripts in scripts/w{s,t}-*.sh — so the helpers
+# Sourced from the user's zshrc (where the real echo_*/master_branch live) AND
+# directly by the tv helper scripts in bin/w{s,t}-*.sh — so the helpers
 # below are defined only as fallbacks when sourced standalone.
 
-WS_ROOT="$HOME/src/workspaces"
-WS_STATE=/tmp/tv-ws          # tv hands the "current workspace" to the wt channel here
-_WS_TPC=~/src/dev_setup/scripts/tmux-pair-cmd.sh
+export WS_ROOT="${WS_ROOT:-$HOME/src/workspaces}"
+export WS_SRC_ROOT="${WS_SRC_ROOT:-$HOME/src}"
+WS_HOOKS_DIR="${WS_HOOKS_DIR:-$HOME/.config/ws/hooks}"
+# tv hands the "current workspace" to the wt channel here. Exported: the tv
+# cables run in tv's child shell and read $WS_STATE.
+export WS_STATE="${WS_STATE:-${XDG_RUNTIME_DIR:-/tmp}/tv-ws}"
 
 # Catppuccin colours matching zshrc's INFO=$TEAL / SUCCESS=$GREEN / FAILURE=$RED.
 (( $+functions[echo_info] ))    || echo_info()    { print -P "%F{#8bd5ca}$*%f"; }
@@ -35,6 +41,28 @@ _WS_TPC=~/src/dev_setup/scripts/tmux-pair-cmd.sh
 (( $+functions[echo_failure] )) || echo_failure() { print -P "%F{#ed8796}$*%f" >&2; }
 # Peach, for warnings that aren't outright failures.
 (( $+functions[echo_warn] ))    || echo_warn()    { print -P "%F{#f5a97f}$*%f" >&2; }
+
+# _ws_hook <name> [VAR=value ...] — run the user hook $WS_HOOKS_DIR/<name> if
+# it exists and is executable, with the given context vars set for THAT
+# process only (so a shell-exported WS_NAME never leaks into a hook about a
+# different workspace). Runs synchronously in the caller's cwd.
+# Returns 127 when there is no such hook, otherwise the hook's exit status.
+#
+# Hooks and their contract (all optional; context: WS_NAME, WS_DIR, WS_ROOT_DIR,
+# WS_BRANCH, and WS_BG=1 when the caller asked for background):
+#   pre-create  before anything is made; non-zero ABORTS creation
+#   created     after every member is set up; WS_DIR = the new repo worktree
+#   switch      on ws/wt switching; WS_DIR = where the switch should land
+#   pre-delete  before deletion; 1 = refuse, 0 = go, other = unknown (warn, go)
+#   deleted     LAST thing _ws_delete does, after the dir is gone
+#   active      wsp only, no context vars: print the names of workspaces still
+#               "open" (one per line); non-zero = can't tell → wsp refuses
+_ws_hook() {
+  local name="$1"; shift
+  local hook="$WS_HOOKS_DIR/$name"
+  [[ -x "$hook" ]] || return 127
+  env "$@" "$hook"
+}
 
 # Ask a yes/no question on the tty; return 0 only on an explicit yes. Defaults
 # to no — so a non-interactive caller (no tty) safely aborts.
@@ -64,7 +92,7 @@ _ws_resolve_main_clone() {
   if [[ "$arg" == */* || "$arg" == "~"* ]]; then
     echo "${arg/#\~/$HOME}"
   else
-    echo "$HOME/src/$arg"
+    echo "$WS_SRC_ROOT/$arg"
   fi
 }
 
@@ -130,7 +158,7 @@ _ws_setup_worktree() {
   #   pre    — BEFORE the worktree is created (cwd = main clone; dest not made)
   #   post   — AFTER it is fully set up       (cwd = the new worktree == WS_DEST)
   #   switch — when switching TO the workspace (ws picker; cwd = the worktree).
-  #            Print a directory to stdout to make the tmux panes land there
+  #            Print a directory to stdout to make the switch land there
   #            instead of the workspace root. See _ws_switch_dir.
   #   delete — BEFORE the worktree is removed (cwd = the worktree, which still
   #            exists). Undo per-worktree resources `post` created OUTSIDE the
@@ -354,11 +382,11 @@ _ws_setup_worktree() {
 
 # _ws_create <repo|path> <branch> [--bg|--no-window] — create a workspace from
 # a repo + branch. Repo-agnostic (the branch is based off origin's default by
-# _ws_setup_worktree, so the clone needn't be on master). Opens and selects the
-# workspace window; with --bg the window is created in the background and not
-# selected; with --no-window no tmux window is made at all (for headless
-# scratch workspaces no human will ever type into — an idle window on one just
-# looks like abandoned work).
+# _ws_setup_worktree, so the clone needn't be on master). Runs the user's
+# `pre-create` hook first and the `created` hook at the end; with --bg the
+# `created` hook is told not to switch to it (WS_BG=1); with --no-window
+# neither hook runs (for headless scratch workspaces no human will ever type
+# into — an idle window on one just looks like abandoned work).
 _ws_create() {
   if [[ -z "$1" || -z "$2" ]]; then
     echo_failure "Usage: _ws_create <repo|path> <branch> [--bg|--no-window]"
@@ -388,31 +416,31 @@ _ws_create() {
     echo_failure "Workspace already exists (and is not empty): $workspace"
     return 1
   fi
-  if [[ -z "$no_window" ]] && tmux list-windows -t mob-editor -F '#{window_name}' 2>/dev/null | grep -qx "$short"; then
-    echo_failure "Tmux window '$short' already exists in mob-editor"
-    return 1
+  local hook_rc
+  if [[ -z "$no_window" ]]; then
+    _ws_hook pre-create WS_NAME="$short" WS_DIR="$workspace" WS_ROOT_DIR="$workspace" WS_BRANCH="$branch"
+    hook_rc=$?
+    if (( hook_rc != 0 && hook_rc != 127 )); then
+      echo_failure "pre-create hook refused workspace '$short' (rc $hook_rc)"
+      return 1
+    fi
   fi
 
   mkdir -p "$workspace"
   # rmdir only removes it if still empty, so an aborted setup leaves no stub.
   _ws_setup_worktree "$main_clone" "$branch" "$workspace/$repo" || { rmdir "$workspace" 2>/dev/null; return 1; }
 
-  # Open the workspace window with its pane already in the repo we just made.
-  # With --bg, create it without switching to it; --no-window skips it.
-  if [[ -n "$no_window" ]]; then
-    :
-  elif [[ -n "$bg" ]]; then
-    "$_WS_TPC" goto mob-editor "$short" "$workspace/$repo" --bg
-  else
-    "$_WS_TPC" goto mob-editor "$short" "$workspace/$repo"
-    "$_WS_TPC" select mob-editor "$short"
+  # Present the workspace (open a window, …) — the user's `created` hook.
+  # --bg asks it not to switch focus; --no-window skips it entirely (headless
+  # scratch workspaces no human will type into).
+  if [[ -z "$no_window" ]]; then
+    _ws_hook created WS_NAME="$short" WS_DIR="$workspace/$repo" WS_ROOT_DIR="$workspace" WS_BRANCH="$branch" ${bg:+WS_BG=1}
+    hook_rc=$?
+    (( hook_rc == 0 || hook_rc == 127 )) || echo_warn "created hook failed for '$short' (rc $hook_rc)"
   fi
 
   echo_success "Workspace ready: $workspace"
   echo_success "Added '$repo' on branch '$branch'"
-  if [[ -z "$no_window" ]]; then
-    echo_success "Tmux window '$short' created${bg:+ (in background)}"
-  fi
   return 0
 }
 
@@ -474,31 +502,33 @@ _ws_switch_dir() {
   echo "$workspace"
 }
 
-# _ws_switch_workspace <workspace-dir> — select its window (creating if
-# missing), landing the panes wherever the members' `switch` hooks point
-# (workspace root if none do).
+# _ws_switch_workspace <workspace-dir> — run the user's `switch` hook with
+# WS_DIR wherever the members' `switch` .ws-init phases point (workspace root
+# if none do).
 _ws_switch_workspace() {
   local workspace="$1"
   [[ -z "$workspace" ]] && { echo_failure "Usage: _ws_switch_workspace <dir>"; return 1; }
-  local short=$(basename "$workspace")
-  "$_WS_TPC" goto mob-editor "$short" "$(_ws_switch_dir "$workspace")"
-  "$_WS_TPC" select mob-editor "$short"
+  local short=$(basename "$workspace") hook_rc
+  _ws_hook switch WS_NAME="$short" WS_DIR="$(_ws_switch_dir "$workspace")" WS_ROOT_DIR="$workspace" WS_BRANCH="$(_ws_branch "$workspace" 2>/dev/null)"
+  hook_rc=$?
+  (( hook_rc == 0 || hook_rc == 127 )) || echo_warn "switch hook failed for '$short' (rc $hook_rc)"
 }
 
-# _ws_switch_worktree <repo-dir> — switch to the workspace window (creating if
-# missing) and cd both panes into the chosen repo's worktree.
+# _ws_switch_worktree <repo-dir> — run the user's `switch` hook with WS_DIR =
+# the chosen repo's worktree.
 _ws_switch_worktree() {
   local repodir="$1"
   [[ -z "$repodir" ]] && { echo_failure "Usage: _ws_switch_worktree <repo-dir>"; return 1; }
   local workspace=$(dirname "$repodir")
-  local short=$(basename "$workspace")
-  "$_WS_TPC" goto mob-editor "$short" "$repodir"
-  "$_WS_TPC" select mob-editor "$short"
+  local short=$(basename "$workspace") hook_rc
+  _ws_hook switch WS_NAME="$short" WS_DIR="$repodir" WS_ROOT_DIR="$workspace" WS_BRANCH="$(_ws_branch "$workspace" 2>/dev/null)"
+  hook_rc=$?
+  (( hook_rc == 0 || hook_rc == 127 )) || echo_warn "switch hook failed for '$short' (rc $hook_rc)"
 }
 
 # _ws_delete <workspace-dir> — run each member repo's .ws-init `delete` hook,
 # remove every member worktree (the branches stay in git), then rm the
-# workspace dir and kill its tmux window.
+# workspace dir and run the user's `deleted` hook.
 _ws_delete() {
   local workspace="$1" force=""
   [[ "${2:-}" == "--force" ]] && force=1
@@ -515,19 +545,20 @@ _ws_delete() {
   fi
 
   local short=$(basename "$workspace")
+  local branch=$(_ws_branch "$workspace" 2>/dev/null)   # before the worktrees go
+  local hook_rc
 
-  # Open PRs: deleting the workspace would orphan them (their branches live
-  # only in this worktree's reflog — see scripts/prs). Refuse unless --force;
-  # if PR state is unknown (gh down, no cache) warn and carry on.
-  local prs="$HOME/src/dev_setup/scripts/prs" prs_rc=0
-  if [[ -z "$force" && -x "$prs" ]]; then
-    "$prs" open-count "$short" >/dev/null 2>&1; prs_rc=$?
-    if (( prs_rc == 1 )); then
-      echo_failure "Workspace $short still has open PRs — merge/close them, 'prs ignore' them, or use --force:"
-      "$prs" list --ws "$short" --offline 2>/dev/null
+  # The user's pre-delete hook may refuse (rc 1 — e.g. open PRs whose branch
+  # lives only in this worktree). Unknown (other non-zero) warns and proceeds;
+  # --force skips the hook entirely.
+  if [[ -z "$force" ]]; then
+    _ws_hook pre-delete WS_NAME="$short" WS_DIR="$workspace" WS_ROOT_DIR="$workspace" WS_BRANCH="$branch"
+    hook_rc=$?
+    if (( hook_rc == 1 )); then
+      echo_failure "Refusing to delete workspace $short (pre-delete hook said no; use --force to override)"
       return 1
-    elif (( prs_rc != 0 )); then
-      echo_warn "PR state for $short unknown (prs rc $prs_rc) — proceeding"
+    elif (( hook_rc != 0 && hook_rc != 127 )); then
+      echo_warn "pre-delete hook for $short returned $hook_rc (unknown) — proceeding"
     fi
   fi
 
@@ -556,27 +587,24 @@ _ws_delete() {
   # Remove whatever remains of the workspace dir.
   [[ -d "$workspace" ]] && rm -rf "$workspace"
 
-  # Free every port the workspace leased (any repo's .ws-init reserves under
-  # the owner key "ws:<name>" — see scripts/ports). Generic: the workspace layer
-  # only knows the owner key, never which ports a repo wanted.
-  if [[ -x "$HOME/src/dev_setup/scripts/ports" ]]; then
-    "$HOME/src/dev_setup/scripts/ports" release "ws:$short" >/dev/null \
-      || echo_warn "Failed to release ports for ws:$short — run 'ports release ws:$short'"
-  fi
   echo_success "Deleted workspace: $workspace"
 
-  # LAST, always: killing the window SIGHUPs this very shell when wsd was run
-  # from inside the workspace's own window. Anything below here would silently
-  # not run — which is exactly how leases used to leak.
-  "$_WS_TPC" kill mob-editor "$short"
+  # LAST, always: the user's `deleted` hook (release leases, kill the window,
+  # …). It may kill the very window this shell runs in, SIGHUPping us —
+  # anything below it would silently not run. Its rc is reported but never
+  # changes ours: the workspace IS gone.
+  _ws_hook deleted WS_NAME="$short" WS_DIR="$workspace" WS_ROOT_DIR="$workspace" WS_BRANCH="$branch"
+  hook_rc=$?
+  (( hook_rc == 0 || hook_rc == 127 )) || echo_warn "deleted hook failed for '$short' (rc $hook_rc)"
+  return 0
 }
 
 # wsc [--bg] <branch> — create a workspace from the repo in the current directory.
 # Works whether you're in the repo's main clone or inside an existing worktree:
 # it resolves the main clone (where the true source lives) and bases the new
 # branch off origin's default, so you can spin up a fresh workspace from within
-# another one without inheriting its branch. --bg creates the tmux windows
-# without switching to them.
+# another one without inheriting its branch. --bg tells the `created` hook not
+# to switch to the new workspace.
 function wsc() {
   local bg="" branch="" arg
   for arg in "$@"; do
@@ -639,17 +667,17 @@ function wsd() {
 
   # If we're standing inside the workspace we're deleting, step out first.
   local cwd=$(pwd -P)
-  [[ "$cwd" == "$workspace"* ]] && cd "$HOME/src"
+  [[ "$cwd" == "$workspace"* ]] && cd "$WS_SRC_ROOT"
 
   _ws_delete "$workspace" ${force:+--force}
 }
 
 # wsp [--yes] [--force] — purge inactive workspaces: delete every workspace
-# with no open tmux window in the mob pair. A window in EITHER half counts as
-# active (spawned Claudes live in mob-shell, the human in mob-editor).
-# Workspaces with uncommitted changes or open PRs are skipped unless --force —
-# committed work is safe either way (branches are kept), but dirt or an open
-# PR's only-copy branch would be lost.
+# the user's `active` hook does not list (with no hook, every workspace is a
+# candidate — the per-workspace gates below still apply). Workspaces with
+# uncommitted changes, or that the `pre-delete` hook refuses (e.g. open PRs),
+# are skipped unless --force — committed work is safe either way (branches are
+# kept), but dirt or an open PR's only-copy branch would be lost.
 # --yes skips the confirmation, for non-interactive callers; without it a
 # tty-less run safely aborts at the prompt.
 function wsp() {
@@ -662,38 +690,39 @@ function wsp() {
     esac
   done
 
-  # With no mob sessions at all (tmux down, fresh boot) EVERY workspace would
-  # look inactive — refuse rather than purge the world.
-  if ! tmux has-session -t mob-editor 2>/dev/null && ! tmux has-session -t mob-shell 2>/dev/null; then
-    echo_failure "No mob-editor/mob-shell tmux sessions running — every workspace would count as inactive. Refusing; use wsd for individual deletes."
+  # Which workspaces are still "open" is the user's `active` hook's call. If it
+  # can't tell (tmux down, fresh boot…) every workspace would look inactive —
+  # refuse rather than purge the world. No hook at all = no presentation layer
+  # = everything is a candidate.
+  local active hook_rc
+  active=$(_ws_hook active); hook_rc=$?
+  if (( hook_rc == 127 )); then
+    active=""
+  elif (( hook_rc != 0 )); then
+    echo_failure "active hook failed (rc $hook_rc) — can't tell which workspaces are open. Refusing; use wsd for individual deletes."
     return 1
   fi
-  # Duplicated windows are named <base>_<n> (tmux-pair-cmd.sh copy), so index
-  # each name both verbatim and with the _<n> suffix stripped — an open X_2
-  # keeps workspace X alive, while a workspace literally named gpt_2 still
-  # matches its own verbatim window name.
-  local open_windows=$(
-    { tmux list-windows -t mob-editor -F '#{window_name}' 2>/dev/null
-      tmux list-windows -t mob-shell  -F '#{window_name}' 2>/dev/null; } \
-    | awk '{ print; if (sub(/_[0-9]+$/, "")) print }' | sort -u)
 
   local ws short repo dirty label
-  local -a purge labels skipped skipped_prs
+  local -a purge labels skipped skipped_hook
   for ws in "$WS_ROOT"/*(/N); do
     short=$(basename "$ws")
-    print -r -- "$open_windows" | grep -qxF "$short" && continue
+    print -r -- "$active" | grep -qxF "$short" && continue
     dirty=0
     for repo in "$ws"/*(/N); do
       [[ -e "$repo/.git" ]] || continue
       [[ -n "$(git -C "$repo" status --porcelain 2>/dev/null)" ]] && dirty=1
     done
-    local open_prs=0
-    if [[ -x "$HOME/src/dev_setup/scripts/prs" ]]; then
-      "$HOME/src/dev_setup/scripts/prs" open-count "$short" >/dev/null 2>&1
-      (( $? == 1 )) && open_prs=1
+    # The pre-delete hook (open PRs, …) gates each candidate; quiet here, the
+    # summary line below reports the skips. _ws_delete asks it again for the
+    # ones actually deleted.
+    local refused=0
+    if [[ -z "$force" ]]; then
+      _ws_hook pre-delete WS_NAME="$short" WS_DIR="$ws" WS_ROOT_DIR="$ws" WS_BRANCH="$(_ws_branch "$ws" 2>/dev/null)" >/dev/null 2>&1
+      (( $? == 1 )) && refused=1
     fi
-    if (( open_prs )) && [[ -z "$force" ]]; then
-      skipped_prs+=("$short")
+    if (( refused )); then
+      skipped_hook+=("$short")
       continue
     fi
     if (( dirty )) && [[ -z "$force" ]]; then
@@ -707,9 +736,9 @@ function wsp() {
   done
 
   (( ${#skipped} )) && echo_warn "Skipping ${#skipped} with uncommitted changes (use --force to include): ${(j:, :)skipped}"
-  (( ${#skipped_prs} )) && echo_warn "Skipping ${#skipped_prs} with open PRs (use --force to include): ${(j:, :)skipped_prs}"
+  (( ${#skipped_hook} )) && echo_warn "Skipping ${#skipped_hook} refused by the pre-delete hook (use --force to include): ${(j:, :)skipped_hook}"
   if (( ${#purge} == 0 )); then
-    echo_success "Nothing to purge — every workspace has an open tmux window."
+    echo_success "Nothing to purge — every workspace is active."
     return 0
   fi
 
@@ -723,7 +752,7 @@ function wsp() {
   # Step out first if we're standing inside one of the doomed workspaces.
   local cwd=$(pwd -P)
   for ws in "${purge[@]}"; do
-    [[ "$cwd" == "$ws"* ]] && { cd "$HOME/src"; break; }
+    [[ "$cwd" == "$ws"* ]] && { cd "$WS_SRC_ROOT"; break; }
   done
 
   for ws in "${purge[@]}"; do
@@ -750,7 +779,7 @@ function wt() {
 # Complete wsa with the repos in ~/src (excluding the workspaces dir).
 _ws_src_repos() {
   local -a repos
-  repos=("$HOME"/src/*(/N:t))
+  repos=("$WS_SRC_ROOT"/*(/N:t))
   repos=(${repos:#${WS_ROOT:t}})
   compadd -a repos
 }
@@ -767,8 +796,8 @@ fi
 
 # WS_NAME=<workspace short name> is exported whenever the shell is inside a
 # workspace (and unset when it leaves), so per-workspace tooling can find its
-# identity without sniffing $PWD — scripts/ports uses it as the default owner
-# (ws:$WS_NAME) for every command when no owner is given.
+# identity without sniffing $PWD — the ports registry uses it as the default
+# owner (ws:$WS_NAME) for every command when no owner is given.
 _ws_export_name() {
   local ws=$(_ws_from_pwd)
   if [[ -n "$ws" ]]; then export WS_NAME="${ws:t}"; else unset WS_NAME; fi
