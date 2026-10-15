@@ -158,6 +158,12 @@ assert_contains "refusal reason shown" "$OUT" "open PRs on nowin"
 assert_dir "workspace kept" "$WS_ROOT/nowin/repo"
 assert_eq "deleted not fired on refusal" "$(hooks_fired)" "pre-delete "
 
+# wsd steps out of the workspace before deleting; on refusal it must step back
+# in, so WS_NAME is still set and a bare `wsd -f` retries the same workspace.
+zws "cd '$WS_ROOT/nowin/repo'; wsd; print -r -- \"PWD=\$PWD WS_NAME=\$WS_NAME\""
+assert_eq "wsd refused rc" "$RC" 0
+assert_contains "wsd refusal leaves you where you were" "$OUT" "PWD=$WS_ROOT/nowin/repo WS_NAME=nowin"
+
 hook pre-delete 'exit 2'
 reset_log
 zws "_ws_delete '$WS_ROOT/nowin'"

@@ -13,7 +13,9 @@
 #   wsc [--bg] <branch>   create a workspace from the current repo (--bg: tell
 #                         the `created` hook not to switch to it)
 #   wsa <repo> [repo...]  add repos to the workspace you're standing in
-#   wsd [name|path]       delete a workspace (worktrees + dir; branches kept)
+#   wsd [-f] [name|path]  delete a workspace (worktrees + dir; branches kept);
+#                         no name = the one you're in, and you stay in it if
+#                         the delete is refused (so `wsd -f` retries)
 #   wsp [--yes] [--force] purge every workspace the `active` hook doesn't list
 #                         (--force includes ones with uncommitted changes or a
 #                         refusing pre-delete hook)
@@ -538,9 +540,11 @@ _ws_delete() {
   [[ "${2:-}" == "--force" ]] && force=1
   [[ -z "$workspace" ]] && { echo_failure "Usage: _ws_delete <workspace-dir> [--force]"; return 1; }
 
-  # Safety: only ever operate under WS_ROOT.
+  # Safety: only ever operate under WS_ROOT (as given, or symlink-resolved —
+  # _ws_from_pwd hands back the physical path).
+  local root_p=$(cd -q "$WS_ROOT" 2>/dev/null && pwd -P)
   case "$workspace" in
-    "$WS_ROOT"/*) ;;
+    "$WS_ROOT"/*|"${root_p:-$WS_ROOT}"/*) ;;
     *) echo_failure "Refusing: '$workspace' is not under $WS_ROOT"; return 1 ;;
   esac
   if [[ ! -d "$workspace" ]]; then
@@ -669,11 +673,16 @@ function wsd() {
     fi
   fi
 
-  # If we're standing inside the workspace we're deleting, step out first.
-  local cwd=$(pwd -P)
+  # If we're standing inside the workspace we're deleting, step out first —
+  # and step back in if the delete fails (e.g. pre-delete refused), so WS_NAME
+  # is restored and a bare `wsd -f` retries the same workspace.
+  local cwd=$(pwd -P) back=$PWD
   [[ "$cwd" == "$workspace"* ]] && cd "$WS_SRC_ROOT"
 
-  _ws_delete "$workspace" ${force:+--force}
+  _ws_delete "$workspace" ${force:+--force} && return 0
+  local rc=$?
+  [[ "$PWD" != "$back" && -d "$back" ]] && cd "$back"
+  return $rc
 }
 
 # wsp [--yes] [--force] — purge inactive workspaces: delete every workspace
