@@ -196,8 +196,13 @@ _ws_setup_worktree() {
   fi
   [[ -z "$main_branch" ]] && main_branch="main"
 
+  # A failed fetch (GitHub down, no network) is NOT fatal: the workspace is based
+  # on the LOCAL default branch anyway, so the only cost is that the behind/ahead
+  # check below reads a stale origin/<main>. Warn loudly and carry on.
   echo_info "Fetching origin in $(basename "$main_clone")..."
-  git -C "$main_clone" fetch origin || { echo_failure "Failed to fetch origin"; return 1; }
+  if ! git -C "$main_clone" fetch origin; then
+    echo_warn "⚠ We couldn't fetch origin for $(basename "$main_clone") — continuing with the local $main_branch as it stands (it may be behind)"
+  fi
 
   # New branches are based on the LOCAL default branch; whether that branch is
   # synced first is the per-repo .ws-init `pre` hook's decision (ploy's runs

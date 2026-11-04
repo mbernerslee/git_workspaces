@@ -72,6 +72,17 @@ assert_no_dir "no stub dir" "$WS_ROOT/nope"
 assert_eq "post never ran" "$(awk '{print $1}' "$INIT_LOG" | tr '\n' ' ')" "pre "
 rm -f "$INIT_PRE_FAIL"
 
+echo "== an unreachable origin warns but still creates (GitHub down ≠ no workspace)"
+reset_log
+git -C "$main" remote set-url origin "$T/origin/nowhere.git"
+zws "_ws_create '$main' offline --no-window"
+git -C "$main" remote set-url origin "$T/origin/repo.git"
+assert_eq "create rc despite failed fetch" "$RC" 0
+assert_contains "…warns about it" "$OUT" "We couldn't fetch origin"
+assert_dir "worktree made anyway" "$WS_ROOT/offline/repo"
+assert_eq "both phases ran" "$(awk '{print $1}' "$INIT_LOG" | tr '\n' ' ')" "pre post "
+zws "_ws_delete '$WS_ROOT/offline'"
+
 echo "== wsa (_ws_add) runs the same phases for the added repo"
 mkrepo other; cp "$main/.ws-init" "$WS_SRC_ROOT/other/.ws-init"
 reset_log

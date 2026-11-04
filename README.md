@@ -85,7 +85,10 @@ it applies to every worktree without being committed) is invoked with the
 phase as `$1` and `WS_DEST` / `WS_BRANCH` / `WS_MAIN_CLONE` in the env:
 
 - `pre` — BEFORE the worktree is created (cwd = main clone; dest not made).
-  Non-zero **aborts** creation — a precondition (e.g. `git pull` first).
+  Non-zero **aborts** creation — a precondition (e.g. a failed build). A
+  `git pull` here should warn and carry on when it fails, as the tooling's own
+  `git fetch origin` does: an unreachable GitHub must never block a workspace,
+  since the branch is based on the local default branch anyway.
 - `post` — AFTER it is fully set up (cwd = the new worktree). Wire up
   per-workspace state: ports, a cloned DB, a generated `.envrc`, …
 - `switch` — when switching TO the workspace (cwd = the worktree). Print a
