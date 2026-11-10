@@ -6,8 +6,9 @@ branch: every repo in it uses the same branch name. Main clones live at
 `$WS_SRC_ROOT/<repo>` (default `~/src`) and are never touched.
 
 Worktrees come **fully set up**: `deps/`, `_build/`, `node_modules/` are
-copied from the main clone (COW where the filesystem has it) with mtimes
-preserved so warm Elixir builds stay warm; `.env`, `.mcp.json`,
+copied from the repo's latest build [snapshot](#snapshots), or else the main
+clone (COW where the filesystem has it), with source mtimes put back so warm
+Elixir builds stay warm; `.env`, `.mcp.json`,
 `.claude/settings.local.json`, `CLAUDE.local.md` are symlinked; a tracked or
 generated `.envrc` is `direnv allow`ed.
 
@@ -16,7 +17,7 @@ is not this repo's business. Two kinds of hook carry everything that varies:
 
 | hook | question it answers | owner | lives in |
 |---|---|---|---|
-| `.ws-init` (`pre`/`post`/`switch`/`delete`) | how to prepare *this repo's* worktree | the repo | the repo's main clone, git-excluded |
+| `.ws-init` (`pre`/`post`/`switch`/`delete`/`build`) | how to prepare *this repo's* worktree | the repo | the repo's main clone, git-excluded |
 | user hooks (`pre-create`/`created`/`switch`/`pre-delete`/`deleted`/`active`) | how to show a workspace *on this machine* | you | `$WS_HOOKS_DIR` (default `~/.config/ws/hooks`) |
 
 ## Install
@@ -96,6 +97,50 @@ phase as `$1` and `WS_DEST` / `WS_BRANCH` / `WS_MAIN_CLONE` in the env:
   first member to print an existing directory wins.
 - `delete` — BEFORE the worktree is removed (cwd = the worktree). Undo what
   `post` created outside the workspace dir. Failure warns, never blocks.
+- `build` — compile the checkout it's run in (cwd = `WS_DEST` = the repo's
+  snapshot checkout). Defining `ws_build` opts the repo into
+  [snapshots](#snapshots). Only `ws-snapshot.sh` runs it.
+
+`pre` also gets `WS_SNAPSHOT=<sha>` when the worktree is starting from a
+snapshot (empty otherwise), so it can skip work the snapshot already did —
+pulling, waiting for a build.
+
+## Snapshots
+
+A **snapshot** is a repo's compiled build output — `deps/`, `_build/`,
+`node_modules/` — for one commit of origin's default branch, plus the mtimes of
+the sources it was compiled from. New worktrees start from the latest one, so
+they open with nothing to compile:
+
+1. **Making one** (`ws-snapshot.sh`, on a schedule): `git fetch` in the main
+   clone; if origin's default branch is at a commit with no snapshot yet, move
+   the repo's **snapshot checkout** (a detached worktree under
+   `$WS_SNAPSHOT_ROOT/<repo>/checkout`) to it, run `.ws-init build` there, then
+   clone the build dirs + record the mtimes into `$WS_SNAPSHOT_ROOT/<repo>/<sha>/`
+   and point `latest` at it. A failed build keeps the previous snapshot. When
+   origin hasn't moved, a run is just the fetch.
+2. **Using one** (any workspace create/add): the branch is based on the
+   snapshot's commit (so up to one schedule interval behind origin), the build
+   dirs are cloned from the snapshot, and each source file gets the mtime it had
+   when compiled — except files that differ from that commit, which keep "now"
+   so the build tool sees them as changed.
+
+A snapshot is used only if origin was confirmed to match it within
+`WS_SNAPSHOT_MAX_AGE`; otherwise — or with `WS_FRESH=1`, or for a repo with no
+`ws_build` — the worktree is set up the old way: build dirs and mtimes from the
+main clone, branch from the local default branch. The main clone is never
+touched beyond `git fetch`.
+
+    ws-snapshot.sh --all            # every repo whose .ws-init defines ws_build
+    ws-snapshot.sh <repo>... [--force]
+    ws-snapshot.sh status           # freshness, whether in use, failures
+    ws-snapshot.sh rm <repo>        # drop a repo's snapshots + checkout
+    WS_FRESH=1 wsc <branch>         # ignore snapshots: latest main, old path
+
+Compiled output can contain the absolute path of the checkout it was built in
+(`__DIR__`, compile-time file paths), so code that depends on those paths at
+runtime sees the snapshot checkout's — the same caveat as copying from the main
+clone.
 
 ## Configuration
 
@@ -105,11 +150,16 @@ phase as `$1` and `WS_DEST` / `WS_BRANCH` / `WS_MAIN_CLONE` in the env:
 | `WS_SRC_ROOT` | `~/src` | where main clones live (exported) |
 | `WS_HOOKS_DIR` | `~/.config/ws/hooks` | user hooks |
 | `WS_STATE` | `$XDG_RUNTIME_DIR/tv-ws` or `/tmp/tv-ws` | tv "current workspace" handoff (exported) |
+| `WS_SNAPSHOT_ROOT` | `$WS_SRC_ROOT/.ws-snapshots` | where snapshots live (same filesystem as the workspaces, for COW) |
+| `WS_SNAPSHOT_MAX_AGE` | `86400` | seconds since origin was last confirmed to match a snapshot before it stops being used |
+| `WS_SNAPSHOT_KEEP` | `3` | snapshots kept per repo |
+| `WS_FRESH` | unset | `1` = don't start new worktrees from snapshots |
 
 ## Tests
 
-    tests/ws_hooks_test.sh   # the user-hook contract (what a hook set is written against)
-    tests/ws_init_test.sh    # the .ws-init protocol
+    tests/ws_hooks_test.sh     # the user-hook contract (what a hook set is written against)
+    tests/ws_init_test.sh      # the .ws-init protocol
+    tests/ws_snapshot_test.sh  # snapshots: making, using, falling back, mtimes
 
-Both build real git repos in a temp dir and refuse to run if `WS_ROOT` isn't
+All build real git repos in a temp dir and refuse to run if `WS_ROOT` isn't
 honoured, so they never touch your real workspaces.

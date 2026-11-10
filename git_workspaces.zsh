@@ -24,6 +24,9 @@
 #   wt                    TV: worktrees in the current workspace — enter=switch,
 #                         ctrl-n=add
 #
+#   ws-snapshot.sh        make / inspect build snapshots new worktrees start
+#                         from (see "Snapshots" below); WS_FRESH=1 bypasses them
+#
 # (ctrl-g avoids the built-in ctrl-l=toggle_layout that shadowed the drill key.)
 #
 # Sourced from the user's zshrc (where the real echo_*/master_branch live) AND
@@ -36,6 +39,18 @@ export WS_HOOKS_DIR="${WS_HOOKS_DIR:-$HOME/.config/ws/hooks}"
 # tv hands the "current workspace" to the wt channel here. Exported: the tv
 # cables run in tv's child shell and read $WS_STATE.
 export WS_STATE="${WS_STATE:-${XDG_RUNTIME_DIR:-/tmp}/tv-ws}"
+# Build snapshots (see "Snapshots" below): where they live, how old the last
+# successful check against origin may be before workspaces stop trusting it,
+# and how many to keep per repo. A dot-dir, so the ~/src repo pickers skip it.
+export WS_SNAPSHOT_ROOT="${WS_SNAPSHOT_ROOT:-$WS_SRC_ROOT/.ws-snapshots}"
+export WS_SNAPSHOT_MAX_AGE="${WS_SNAPSHOT_MAX_AGE:-86400}"
+export WS_SNAPSHOT_KEEP="${WS_SNAPSHOT_KEEP:-3}"
+# Directory of this file (lib/ holds helpers). %x = the file being sourced.
+_WS_HOME="${${(%):-%x}:A:h}"
+# The gitignored build-output dirs carried into a new worktree (from a snapshot,
+# or else from the main clone). deps/ before _build/: _build/<env>/lib/<dep>/
+# {src,include,priv} are relative symlinks into deps/.
+_WS_ARTIFACT_DIRS=(deps _build node_modules)
 
 # Catppuccin colours matching zshrc's INFO=$TEAL / SUCCESS=$GREEN / FAILURE=$RED.
 (( $+functions[echo_info] ))    || echo_info()    { print -P "%F{#8bd5ca}$*%f"; }
@@ -82,14 +97,42 @@ _ws_confirm() {
 }
 
 # Copy preserving mtimes (the warm-_build trick depends on them) with COW where
-# the fs has it: APFS clonefile on macOS; GNU cp elsewhere (--reflink=auto uses
-# COW on btrfs/xfs and silently falls back to a plain copy on ext4).
+# the fs has it. macOS: clone the whole tree in one clonefile(2) call
+# (lib/ws_clone.py — ~15x faster than cp -Rc, which clones file by file); if
+# that can't be used (dest exists, other volume, no python3), cp -Rc. Elsewhere
+# GNU cp (--reflink=auto uses COW on btrfs/xfs, plain copy on ext4).
 _ws_copy() {
   if [[ "$OSTYPE" == darwin* ]]; then
+    if [[ ! -e "$2" && -d "$1" ]] && command -v python3 >/dev/null 2>&1; then
+      python3 "$_WS_HOME/lib/ws_clone.py" "$1" "$2" 2>/dev/null && return 0
+      rm -rf "$2"   # never let cp copy INTO a half-made clone
+    fi
     cp -Rc "$1" "$2"
   else
     cp -a --reflink=auto "$1" "$2"
   fi
+}
+
+# _ws_main_branch <main_clone> — the repo's default branch name: origin/HEAD,
+# else whichever of main/master exists locally, else "main".
+_ws_main_branch() {
+  local main_clone="$1" b
+  b=$(git -C "$main_clone" symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@')
+  if [[ -z "$b" ]]; then
+    for b in main master ""; do
+      [[ -n "$b" ]] && git -C "$main_clone" show-ref --verify --quiet "refs/heads/$b" && break
+    done
+  fi
+  echo "${b:-main}"
+}
+
+# _ws_mtimes save|restore … — see lib/ws_mtimes.py (one process for all files).
+_ws_mtimes() {
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo_warn "⚠ python3 not found — skipping mtimes (expect a fuller recompile)"
+    return 1
+  fi
+  python3 "$_WS_HOME/lib/ws_mtimes.py" "$@"
 }
 
 # Resolve a repo argument (bare name under ~/src, or a path) to a main-clone path.
@@ -145,6 +188,193 @@ _ws_short_name() {
   echo "$result"
 }
 
+# ── Snapshots ────────────────────────────────────────────────────────────────
+# A snapshot is a repo's compiled build output (deps/, _build/, node_modules/)
+# for ONE commit of origin's default branch, plus the mtimes of the sources it
+# was compiled from. New worktrees start from the latest one — branch based on
+# its commit, build dirs cloned from it, mtimes put back — so they open with
+# nothing to compile. Layout, per repo:
+#
+#   $WS_SNAPSHOT_ROOT/<repo>/
+#     checkout/     a detached worktree of the main clone; builds happen HERE
+#     <sha>/        a finished snapshot: deps/ _build/ … + mtimes + commit (info)
+#     latest ->     the newest finished snapshot
+#     checked       when origin was last confirmed to match `latest`
+#     build.log     the last build's output;  last-error  only while failing
+#     lock/         held while a snapshot is being made
+#
+# Opt-in per repo: its .ws-init defines ws_build (the `build` phase), which
+# compiles the checkout it's run in (cwd = WS_DEST = the checkout). The main
+# clone is never touched beyond `git fetch`. Made by `ws-snapshot.sh`, normally
+# on a schedule.
+
+_ws_snapshot_dir() { echo "$WS_SNAPSHOT_ROOT/${1:t}"; }
+
+# _ws_snapshot_field <snapshot-dir> <key> — a value from its `commit` file.
+_ws_snapshot_field() { sed -n "s/^$2=//p" "$1/commit" 2>/dev/null; }
+
+# _ws_age <epoch> — "42s" / "7m" / "3h" / "2d" since then.
+_ws_age() {
+  local s=$(( $(date +%s) - ${1:-0} ))
+  if (( s < 60 )); then echo "${s}s"
+  elif (( s < 3600 )); then echo "$(( s / 60 ))m"
+  elif (( s < 86400 )); then echo "$(( s / 3600 ))h"
+  else echo "$(( s / 86400 ))d"; fi
+}
+
+# _ws_snapshot_opted_in <main_clone> — does its .ws-init define a build phase?
+_ws_snapshot_opted_in() {
+  [[ -x "$1/.ws-init" ]] && grep -q 'ws_build' "$1/.ws-init" 2>/dev/null
+}
+
+# _ws_snapshot_usable <main_clone> — echo the latest snapshot's dir if a new
+# worktree may start from it: it exists, its commit is in the repo, and origin
+# was confirmed to match it within WS_SNAPSHOT_MAX_AGE (so a dead scheduler
+# can't silently base everything on an ancient main).
+_ws_snapshot_usable() {
+  local main_clone="$1" sdir=$(_ws_snapshot_dir "$1")
+  local snap="$sdir/latest"
+  [[ -f "$snap/commit" && -f "$snap/mtimes" ]] || return 1
+  snap="${snap:A}"
+  local sha=$(_ws_snapshot_field "$snap" sha)
+  [[ -n "$sha" ]] && git -C "$main_clone" cat-file -e "$sha^{commit}" 2>/dev/null || return 1
+  local checked=$(cat "$sdir/checked" 2>/dev/null)
+  (( $(date +%s) - ${checked:-0} <= WS_SNAPSHOT_MAX_AGE )) || return 1
+  echo "$snap"
+}
+
+# _ws_snapshot_point_latest <sdir> <sha> — repoint `latest` atomically.
+_ws_snapshot_point_latest() {
+  ln -sfn "$2" "$1/latest.new" || return 1
+  if [[ "$OSTYPE" == darwin* ]]; then mv -fh "$1/latest.new" "$1/latest"
+  else mv -fT "$1/latest.new" "$1/latest"; fi
+}
+
+# _ws_snapshot <repo|path> [--force] — bring the repo's snapshot up to date with
+# origin's default branch: fetch; if that commit has no snapshot yet (or
+# --force), move the checkout to it, run `.ws-init build` there, and save the
+# result as a new snapshot. Returns non-zero only when a build fails (or the
+# repo isn't usable). Safe to run often: a no-op when nothing moved.
+_ws_snapshot() {
+  local main_clone=$(_ws_resolve_main_clone "$1") force=""
+  [[ "${2:-}" == --force ]] && force=1
+  local repo="${main_clone:t}"
+  if [[ ! -e "$main_clone/.git" ]]; then
+    echo_failure "No git repo at $main_clone"; return 1
+  fi
+  if ! _ws_snapshot_opted_in "$main_clone"; then
+    echo_failure "$repo: its .ws-init has no build phase (ws_build) — nothing to snapshot"; return 1
+  fi
+
+  local sdir=$(_ws_snapshot_dir "$main_clone")
+  mkdir -p "$sdir" || return 1
+  if ! mkdir "$sdir/lock" 2>/dev/null; then
+    local holder=$(cat "$sdir/lock/pid" 2>/dev/null)
+    if [[ -n "$holder" ]] && kill -0 "$holder" 2>/dev/null; then
+      echo_info "$repo: a snapshot is already being made (pid $holder) — skipping"; return 0
+    fi
+    echo_warn "$repo: clearing a stale snapshot lock (pid ${holder:-?} is gone)"
+    rm -rf "$sdir/lock"; mkdir "$sdir/lock" || return 1
+  fi
+  echo $$ >"$sdir/lock/pid"
+
+  {
+    local main_branch=$(_ws_main_branch "$main_clone") fetched=1
+    if ! git -C "$main_clone" fetch -q origin; then
+      fetched=""
+      echo_warn "⚠ $repo: couldn't fetch origin — snapshotting origin/$main_branch as last fetched"
+    fi
+    local sha=$(git -C "$main_clone" rev-parse -q --verify "origin/$main_branch^{commit}")
+    if [[ -z "$sha" ]]; then
+      echo_failure "$repo: no origin/$main_branch to snapshot"; return 1
+    fi
+
+    if [[ -z "$force" && -f "$sdir/$sha/commit" ]]; then
+      [[ "${${:-$sdir/latest}:A}" == "$sdir/$sha" ]] || _ws_snapshot_point_latest "$sdir" "$sha"
+      [[ -n "$fetched" ]] && date +%s >"$sdir/checked"
+      echo_info "$repo: snapshot ${sha:0:12} is current"
+      return 0
+    fi
+
+    local co="$sdir/checkout"
+    if [[ ! -e "$co/.git" ]]; then
+      echo_info "$repo: creating the snapshot checkout..."
+      git -C "$main_clone" worktree prune
+      git -C "$main_clone" worktree add -q --detach "$co" "$sha" || { echo_failure "$repo: couldn't create $co"; return 1; }
+      # Seed it from the main clone's build (if any) so the first build is
+      # incremental too. Same rules as a new workspace.
+      local d
+      for d in "${_WS_ARTIFACT_DIRS[@]}"; do
+        [[ -d "$main_clone/$d" ]] && _ws_copy "$main_clone/$d" "$co/$d"
+      done
+      _ws_mtimes restore "$co" "$(git -C "$main_clone" rev-parse HEAD)" --from-dir "$main_clone" >/dev/null
+    else
+      # Only files that differ between the two commits are rewritten (and get
+      # a fresh mtime), so the build recompiles just what changed.
+      git -C "$co" checkout -q --detach -f "$sha" || { echo_failure "$repo: couldn't check out ${sha:0:12} in $co"; return 1; }
+    fi
+
+    echo_info "$repo: building ${sha:0:12} (log: $sdir/build.log)..."
+    ( cd "$co" && WS_DEST="$co" WS_BRANCH="" WS_MAIN_CLONE="$main_clone" WS_SNAPSHOT="$sha" \
+        "$main_clone/.ws-init" build ) >"$sdir/build.log" 2>&1
+    local rc=$?
+    if (( rc != 0 )); then
+      printf 'sha=%s\nat=%s\nrc=%s\n' "$sha" "$(date +%s)" "$rc" >"$sdir/last-error"
+      echo_failure "$repo: build of ${sha:0:12} failed (rc $rc) — keeping the previous snapshot. Last lines of $sdir/build.log:"
+      tail -n 20 "$sdir/build.log" >&2
+      return 1
+    fi
+
+    local tmp="$sdir/$sha.tmp"
+    rm -rf "$tmp"; mkdir "$tmp" || return 1
+    for d in "${_WS_ARTIFACT_DIRS[@]}"; do
+      [[ -d "$co/$d" ]] && { _ws_copy "$co/$d" "$tmp/$d" || { rm -rf "$tmp"; return 1; } }
+    done
+    _ws_mtimes save "$co" "$tmp/mtimes" || { rm -rf "$tmp"; return 1; }
+    printf 'sha=%s\nbranch=%s\nbuilt=%s\n' "$sha" "$main_branch" "$(date +%s)" >"$tmp/commit"
+    rm -rf "$sdir/$sha"
+    mv "$tmp" "$sdir/$sha" && _ws_snapshot_point_latest "$sdir" "$sha" || return 1
+    [[ -n "$fetched" ]] && date +%s >"$sdir/checked"
+    rm -f "$sdir/last-error"
+
+    # Keep the newest WS_SNAPSHOT_KEEP (never the one `latest` points at).
+    local keep_target="${${:-$sdir/latest}:A}" n=0 s
+    for s in "$sdir"/*(/Nom); do
+      [[ "${s:t}" == (checkout|lock) || "$s" == "$keep_target" ]] && continue
+      [[ "${s:t}" == *.tmp ]] && { rm -rf "$s"; continue; }
+      [[ -f "$s/commit" ]] || continue
+      (( ++n >= WS_SNAPSHOT_KEEP )) && rm -rf "$s"
+    done
+    echo_success "$repo: snapshot ${sha:0:12} ready"
+  } always {
+    rm -rf "$sdir/lock"
+  }
+}
+
+# _ws_snapshot_status <main_clone> — one human-readable block about it.
+_ws_snapshot_status() {
+  local main_clone="$1" repo="${1:t}" sdir=$(_ws_snapshot_dir "$1")
+  local snap="$sdir/latest"
+  print -r -- "$repo"
+  if [[ -f "$snap/commit" ]]; then
+    snap="${snap:A}"
+    local sha=$(_ws_snapshot_field "$snap" sha) mb=$(_ws_snapshot_field "$snap" branch)
+    local behind=$(git -C "$main_clone" rev-list --count "$sha..origin/$mb" 2>/dev/null)
+    print -r -- "  latest:   ${sha:0:12}, built $(_ws_age "$(_ws_snapshot_field "$snap" built)") ago, ${behind:-?} commit(s) behind origin/$mb (as last fetched)"
+    print -r -- "  checked:  $( [[ -f $sdir/checked ]] && echo "$(_ws_age "$(cat "$sdir/checked")") ago" || echo never)"
+    if _ws_snapshot_usable "$main_clone" >/dev/null; then
+      print -r -- "  in use:   yes — new worktrees start from it"
+    else
+      print -r -- "  in use:   NO — not confirmed against origin within ${WS_SNAPSHOT_MAX_AGE}s; new worktrees use the main clone"
+    fi
+  else
+    print -r -- "  latest:   none"
+  fi
+  [[ -d "$sdir/lock" ]] && print -r -- "  building: now (pid $(cat "$sdir/lock/pid" 2>/dev/null))"
+  [[ -f "$sdir/last-error" ]] && print -r -- "  FAILING:  last build of $(sed -n 's/^sha=//p' "$sdir/last-error" | cut -c1-12) failed $(_ws_age "$(sed -n 's/^at=//p' "$sdir/last-error")") ago — see $sdir/build.log"
+  return 0
+}
+
 # Add a worktree for one repo into a workspace.
 #   _ws_setup_worktree <main_clone> <branch> <dest>
 # Resolves the branch (remote / local / new-from-master), copies build
@@ -174,27 +404,31 @@ _ws_setup_worktree() {
   # `ws_delete` and dispatches on the phase, defining only the phase(s) it
   # cares about. All phases get the same context via env: WS_DEST / WS_BRANCH /
   # WS_MAIN_CLONE. A non-zero `pre` ABORTS creation — it is a precondition.
+  #   build  — not run here: `ws-snapshot.sh` runs it in the repo's snapshot
+  #            checkout to compile a snapshot (see _ws_snapshot).
+  #
+  # When the repo has a usable snapshot (and WS_FRESH isn't set), the worktree
+  # starts from it: a new branch is based on the snapshot's commit and the build
+  # dirs come from the snapshot. `pre` is told via WS_SNAPSHOT=<sha> (empty when
+  # not using one), so it can skip work the snapshot already did (pull, build).
+  local snap="" snap_sha=""
+  if [[ -z "${WS_FRESH:-}" ]] && snap=$(_ws_snapshot_usable "$main_clone"); then
+    snap_sha=$(_ws_snapshot_field "$snap" sha)
+    echo_info "Using snapshot ${snap_sha:0:12} of $(basename "$main_clone") (built $(_ws_age "$(_ws_snapshot_field "$snap" built)") ago)"
+  else
+    snap=""
+  fi
+
   if [[ -x "$main_clone/.ws-init" ]]; then
     echo_info "Running .ws-init pre from $(basename "$main_clone")..."
     if ! ( cd "$main_clone" && WS_DEST="$dest" WS_BRANCH="$branch" WS_MAIN_CLONE="$main_clone" \
-             "$main_clone/.ws-init" pre ); then
+             WS_SNAPSHOT="$snap_sha" "$main_clone/.ws-init" pre ); then
       echo_failure ".ws-init pre failed — aborting worktree creation for $(basename "$main_clone")"
       return 1
     fi
   fi
 
-  local main_branch=$(git -C "$main_clone" symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@')
-  if [[ -z "$main_branch" ]]; then
-    # No origin/HEAD recorded locally — guess from the usual suspects.
-    local b
-    for b in main master; do
-      if git -C "$main_clone" show-ref --verify --quiet "refs/heads/$b"; then
-        main_branch="$b"
-        break
-      fi
-    done
-  fi
-  [[ -z "$main_branch" ]] && main_branch="main"
+  local main_branch=$(_ws_main_branch "$main_clone")
 
   # A failed fetch (GitHub down, no network) is NOT fatal: the workspace is based
   # on the LOCAL default branch anyway, so the only cost is that the behind/ahead
@@ -211,7 +445,13 @@ _ws_setup_worktree() {
   # surprise. Repos with no local copy of the default branch fall back to
   # origin's.
   local base_ref="origin/$main_branch"
-  if git -C "$main_clone" show-ref --verify --quiet "refs/heads/$main_branch"; then
+  if [[ -n "$snap" ]]; then
+    # Based on exactly the commit the snapshot compiled, so the copied build
+    # matches the sources (up to one snapshot interval behind origin).
+    base_ref="$snap_sha"
+    local behind=$(git -C "$main_clone" rev-list --count "$snap_sha..origin/$main_branch" 2>/dev/null)
+    (( behind > 0 )) && echo_info "Snapshot is $behind commit(s) behind origin/$main_branch (WS_FRESH=1 for the latest, built here)"
+  elif git -C "$main_clone" show-ref --verify --quiet "refs/heads/$main_branch"; then
     base_ref="$main_branch"
     if git -C "$main_clone" show-ref --verify --quiet "refs/remotes/origin/$main_branch"; then
       local behind=$(git -C "$main_clone" rev-list --count "$main_branch..origin/$main_branch" 2>/dev/null)
@@ -251,39 +491,34 @@ _ws_setup_worktree() {
     git -C "$main_clone" worktree add "$dest" -b "$branch" "$base_ref" || { echo_failure "Failed to create worktree"; return 1; }
   fi
 
-  # Copy build artifacts if they exist.
-  # deps/ must be copied BEFORE _build/, because _build/<env>/lib/<dep>/{src,include,priv}
-  # are relative symlinks into deps/. If deps/ isn't there yet, the touch step below
-  # follows the dangling symlinks and fails to create files at non-existent targets.
-  if [[ -d "$main_clone/deps" ]]; then
-    echo_info "Copying deps/..."
-    _ws_copy "$main_clone/deps" "$dest/deps"
-  fi
-  if [[ -d "$main_clone/_build" ]]; then
-    echo_info "Copying _build/..."
-    _ws_copy "$main_clone/_build" "$dest/_build"
-  fi
-  # JS deps (e.g. ploy-client): node_modules is gitignored so the worktree has
-  # none — without it `npm run dev` can't find local bins like vite. Clone-copy
-  # it (APFS COW, keeps the relative .bin symlinks intact).
-  if [[ -d "$main_clone/node_modules" ]]; then
-    echo_info "Copying node_modules/..."
-    _ws_copy "$main_clone/node_modules" "$dest/node_modules"
-  fi
+  # Copy the gitignored build dirs (deps/, _build/, node_modules/) from the
+  # snapshot, or else from the main clone. COW clones, mtimes preserved. Without
+  # node_modules e.g. `npm run dev` can't find local bins like vite.
+  local src_dir="${snap:-$main_clone}" d
+  for d in "${_WS_ARTIFACT_DIRS[@]}"; do
+    if [[ -d "$src_dir/$d" ]]; then
+      echo_info "Copying $d/..."
+      _ws_copy "$src_dir/$d" "$dest/$d"
+    fi
+  done
+
   # git worktree add stamps EVERY checked-out file with the current time, which
   # breaks Elixir's incremental build. On `mix compile`, Mix compares the mtime
   # of mix.exs and config/*.exs against what the copied manifest recorded; if
   # any are newer it concludes "config changed" and forces a FULL recompile —
   # the digest fallback that protects ordinary source files does NOT apply to
-  # this config-staleness check, so the relocated _build is thrown away. Restore
-  # each tracked file's mtime from the main clone (same commit = same content),
-  # so the worktree looks mtime-identical to the state the manifest was built
-  # against. -z makes this robust to spaces/newlines in paths. (Repo-agnostic:
-  # copying mtimes from an identical checkout is always safe.)
-  echo_info "Restoring file mtimes from $(basename "$main_clone")..."
-  git -C "$dest" ls-files -z | while IFS= read -r -d '' f; do
-    [[ -e "$main_clone/$f" && -e "$dest/$f" ]] && touch -r "$main_clone/$f" "$dest/$f"
-  done
+  # this config-staleness check, so the relocated _build is thrown away. So put
+  # back the mtimes the build was made against: recorded in the snapshot, or
+  # read off the main clone. Only for files whose content matches the build's
+  # commit — a file that differs (an existing branch, a stale main clone) keeps
+  # "now" so it's seen as changed. (Repo-agnostic: it's just file mtimes.)
+  if [[ -n "$snap" ]]; then
+    echo_info "Restoring file mtimes from the snapshot..."
+    _ws_mtimes restore "$dest" "$snap_sha" --from-file "$snap/mtimes"
+  else
+    echo_info "Restoring file mtimes from $(basename "$main_clone")..."
+    _ws_mtimes restore "$dest" "$(git -C "$main_clone" rev-parse HEAD)" --from-dir "$main_clone"
+  fi
 
   # NOTE: do NOT bump _build/deps mtimes to "now". _ws_copy already
   # preserves the main clone's mtimes, which is exactly what the manifest
