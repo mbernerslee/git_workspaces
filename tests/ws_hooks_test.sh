@@ -198,6 +198,24 @@ assert_contains "hook got the deleted workspace's name, not the shell's" "$(hook
 assert_no_dir "bbb removed" "$WS_ROOT/bbb"
 assert_dir "aaa untouched" "$WS_ROOT/aaa/repo"
 
+echo "== wsd with several names deletes each, carrying on past a refusal"
+for w in m1 m2 m3; do zws "_ws_create '$WS_SRC_ROOT/repo' $w --no-window"; done
+hook pre-delete '[ "$WS_NAME" = m2 ] && exit 1; exit 0'
+reset_log
+zws "cd '$WS_ROOT/m2/repo'; wsd m1 m2 m3; echo \"RC=\$? PWD=\$PWD\""
+assert_contains "rc is the failure's" "$OUT" "RC=1 "
+assert_contains "refused one you stood in: you're back in it" "$OUT" "PWD=$WS_ROOT/m2/repo"
+assert_contains "failure summarised" "$OUT" "1 of 3 workspace(s) not deleted: m2"
+assert_no_dir "m1 removed" "$WS_ROOT/m1"
+assert_dir "m2 kept" "$WS_ROOT/m2/repo"
+assert_no_dir "m3 removed (after the refusal)" "$WS_ROOT/m3"
+hook pre-delete
+zws "_ws_create '$WS_SRC_ROOT/repo' m4 --no-window"
+zws "cd '$WS_ROOT/m2/repo'; wsd -f m2 m4; echo \"RC=\$? PWD=\$PWD\""
+assert_contains "all deleted rc 0, stepped out" "$OUT" "RC=0 PWD=$WS_SRC_ROOT"
+assert_no_dir "m2 removed" "$WS_ROOT/m2"
+assert_no_dir "m4 removed" "$WS_ROOT/m4"
+
 echo "== wsp: active hook decides candidates"
 hook active 'exit 1'
 reset_log

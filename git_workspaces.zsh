@@ -13,9 +13,10 @@
 #   wsc [--bg] <branch>   create a workspace from the current repo (--bg: tell
 #                         the `created` hook not to switch to it)
 #   wsa <repo> [repo...]  add repos to the workspace you're standing in
-#   wsd [-f] [name|path]  delete a workspace (worktrees + dir; branches kept);
-#                         no name = the one you're in, and you stay in it if
-#                         the delete is refused (so `wsd -f` retries)
+#   wsd [-f] [name|path ...]  delete workspaces (worktrees + dir; branches
+#                         kept); several names = delete each, carrying on past
+#                         refusals; no name = the one you're in, and you stay
+#                         in it if the delete is refused (so `wsd -f` retries)
 #   wsp [--yes] [--force] purge every workspace the `active` hook doesn't list
 #                         (--force includes ones with uncommitted changes or a
 #                         refusing pre-delete hook)
@@ -970,38 +971,55 @@ function wsa() {
   [[ -n "$_WS_LAST_ADDED" ]] && cd "$_WS_LAST_ADDED"
 }
 
-# wsd [name|path] — delete a workspace (defaults to the one you're standing in).
+# wsd [-f] [name|path ...] — delete one or more workspaces (defaults to the
+# one you're standing in). Each is deleted independently: a refusal or failure
+# on one doesn't stop the rest; the rc is the last failure's (0 if all went).
 function wsd() {
-  local workspace force="" arg name=""
+  local workspace force="" arg
+  local -a workspaces
   for arg in "$@"; do
     case "$arg" in
       --force|-f) force=1 ;;
-      *) name="$arg" ;;
+      *)
+        if [[ "$arg" == */* || "$arg" == "~"* ]]; then
+          workspaces+=("${arg/#\~/$HOME}")
+        else
+          workspaces+=("$WS_ROOT/$arg")
+        fi
+        ;;
     esac
   done
-  if [[ -n "$name" ]]; then
-    if [[ "$name" == */* || "$name" == "~"* ]]; then
-      workspace="${name/#\~/$HOME}"
-    else
-      workspace="$WS_ROOT/$name"
-    fi
-  else
+  if (( ${#workspaces} == 0 )); then
     workspace=$(_ws_from_pwd)
     if [[ -z "$workspace" ]]; then
-      echo_failure "Not inside a workspace; pass one: wsd [--force] <name>"
+      echo_failure "Not inside a workspace; pass one or more: wsd [--force] <name>..."
       return 1
     fi
+    workspaces=("$workspace")
   fi
 
-  # If we're standing inside the workspace we're deleting, step out first —
-  # and step back in if the delete fails (e.g. pre-delete refused), so WS_NAME
+  # If we're standing inside a workspace we're deleting, step out first —
+  # and step back in if it survives (e.g. pre-delete refused), so WS_NAME
   # is restored and a bare `wsd -f` retries the same workspace.
   local cwd=$(pwd -P) back=$PWD
-  [[ "$cwd" == "$workspace"* ]] && cd "$WS_SRC_ROOT"
+  local real
+  for workspace in "${workspaces[@]}"; do
+    real=${workspace:A}
+    [[ "$cwd" == "$real" || "$cwd" == "$real"/* ]] && { cd "$WS_SRC_ROOT"; break; }
+  done
 
-  _ws_delete "$workspace" ${force:+--force} && return 0
-  local rc=$?
+  local rc=0 one_rc
+  local -a failed
+  for workspace in "${workspaces[@]}"; do
+    _ws_delete "$workspace" ${force:+--force}
+    one_rc=$?
+    (( one_rc )) && { rc=$one_rc; failed+=("${workspace:t}"); }
+  done
+
   [[ "$PWD" != "$back" && -d "$back" ]] && cd "$back"
+  if (( ${#workspaces} > 1 && ${#failed} )); then
+    echo_failure "${#failed} of ${#workspaces} workspace(s) not deleted: ${(j:, :)failed}"
+  fi
   return $rc
 }
 

@@ -34,7 +34,8 @@ for the `ws`/`wt` pickers.
     wsc [--bg] <branch>    create a workspace from the repo you're in (--bg: tell the
                            `created` hook not to switch to it)
     wsa <repo> [repo...]   add repos to the workspace you're standing in
-    wsd [--force] [name]   delete a workspace (worktrees + dir; branches kept)
+    wsd [--force] [name...] delete workspaces (worktrees + dir; branches kept);
+                           several names = each in turn, carrying on past refusals
     wsp [--yes] [--force]  purge every workspace the `active` hook doesn't list
     ws                     tv picker: workspaces — enter=switch, ctrl-g=drill into
                            repos, ctrl-n=new, ctrl-d=delete
