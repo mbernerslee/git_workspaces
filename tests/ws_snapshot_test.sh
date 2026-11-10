@@ -44,6 +44,7 @@ mkrepo() {  # mkrepo <name> [with-build]
     cat >"$WS_SRC_ROOT/$1/.ws-init" <<'EOF'
 #!/usr/bin/env bash
 echo "$1 PWD=$PWD WS_SNAPSHOT=${WS_SNAPSHOT-unset} HEAD=$(git rev-parse HEAD 2>/dev/null)" >>"$LOG"
+echo "hello from the $1 hook"
 ws_build() {
   [ -e "$BUILD_FAIL" ] && { echo "boom"; exit 3; }
   mkdir -p _build deps
@@ -126,6 +127,21 @@ assert_file "deps copied from the snapshot" "$w/deps/dep"
 assert_contains "pre told WS_SNAPSHOT" "$(grep '^pre ' "$LOG")" "WS_SNAPSHOT=$sha1"
 assert_eq "source mtime = the checkout's at build time" "$(mtime "$w/lib/b.ex")" "$co_mtime"
 assert_eq "mix.exs mtime restored too" "$(mtime "$w/mix.exs")" "$(mtime "$S/checkout/mix.exs")"
+
+echo "== output says who is talking: [ws:…] = this library, [hook:…] = a hook"
+plain="$(sed $'s/\x1b\\[[0-9;]*m//g' <<<"$OUT")"
+assert_contains "first header names the library" "$(head -1 <<<"$plain")" "[ws:create] workspace 'feat'"
+assert_contains "first header shows where the library lives" "$(head -1 <<<"$plain")" "(git_workspaces: "
+assert_contains "snapshot step" "$plain" "[ws:snapshot] app: using snapshot ${sha1:0:12}"
+assert_contains "hook header names the file that runs" "$plain" "[hook:.ws-init pre] $main/.ws-init"
+assert_contains "hook output is nested" "$plain" "  │ hello from the pre hook"
+assert_contains "git output is nested" "$plain" "  │ Preparing worktree"
+after_pre="$(grep -A1 '│ hello from the pre hook' <<<"$plain" | tail -1)"
+assert_contains "back to the library after the hook" "$after_pre" "[ws:git]"
+assert_contains "post hook header" "$plain" "[hook:.ws-init post] $main/.ws-init"
+assert_contains "done step" "$(tail -2 <<<"$plain")" "[ws:done] workspace 'feat' ready"
+n_untagged="$(grep -cvE '^(\[(ws|hook):|  )' <<<"$plain")"
+assert_eq "every line is a [tag] header or an indented detail" "$n_untagged" "0"
 
 echo "== the next snapshot run picks up origin's new commit"
 snap app

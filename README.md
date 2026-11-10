@@ -52,6 +52,33 @@ Inside a workspace the shell exports `WS_NAME=<short>` (a `chpwd` hook), so
 per-workspace tooling — e.g. the `ports` registry (`~/src/ports`) —
 can find its identity without sniffing `$PWD`.
 
+## Reading the output
+
+Every line says who is talking, so it's always clear what code is running:
+
+| line | means |
+|---|---|
+| `[ws:<step>] …` | **this library** (`git_workspaces.zsh`) starting a step: `create`, `add`, `delete`, `purge`, `snapshot`, `git`, `copy`, `mtimes`, `links`, `done`. A command's first header also prints where the library lives. |
+| `  detail` | more about the current step (indented, no brackets); `  ✓` / `  ⚠` / `  ✗` = done / warning / failure |
+| `[hook:<name>] <file>` | handing over to a **hook**: `<file>` is the code that runs (`a → b` when it's a symlink — `b` is the real file) |
+| `  │ …` | that hook's (or git's) own output, verbatim |
+
+After a hook, the next line is always a `[ws:…]` header again — back in this
+library. For example:
+
+    [ws:create] workspace 'feat' (branch 'feat') from ploy-server  (git_workspaces: ~/src/git_workspaces)
+    [ws:snapshot] ploy-server: using snapshot d632732f8a11 (built 22m ago) — ~/src/.ws-snapshots/…
+    [hook:.ws-init pre] ~/src/ploy-server/.ws-init → ~/src/dev_setup/ploy/server/ws-init  (in ~/src/ploy-server)
+    [ws:git] ploy-server: worktree at ~/src/workspaces/feat/ploy-server — new branch 'feat' from …
+      │ Preparing worktree (new branch 'feat')
+    [ws:copy] ploy-server: build dirs deps/ _build/ from the snapshot …
+    [ws:mtimes] ploy-server: source file mtimes as recorded in the snapshot
+      18440 restored, 0 changed since the build kept fresh
+    [hook:.ws-init post] ~/src/ploy-server/.ws-init → ~/src/dev_setup/ploy/server/ws-init  (in …/feat/ploy-server)
+      │ DBs ready for 'feat'
+    [hook:created] ~/.config/ws/hooks/created
+    [ws:done] workspace 'feat' ready
+
 ## User hooks
 
 Optional executables in `$WS_HOOKS_DIR`. A missing hook means that step is

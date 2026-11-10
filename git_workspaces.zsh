@@ -59,6 +59,48 @@ _WS_ARTIFACT_DIRS=(deps _build node_modules)
 # Peach, for warnings that aren't outright failures.
 (( $+functions[echo_warn] ))    || echo_warn()    { print -P "%F{#f5a97f}$*%f" >&2; }
 
+# ── Output ───────────────────────────────────────────────────────────────────
+# Every line says WHO is talking, so it's always clear what code is running:
+#
+#   [ws:<step>] …          THIS library (git_workspaces) starting <step>
+#     detail               more about that step — indented, no brackets
+#   [hook:<name>] <file>   handing over to a hook; <file> is the code that runs
+#     │ …                  that hook's (or git's) own output, verbatim
+#
+# After a hook, the next line is always a [ws:…] header again — back in this
+# library. Warnings (⚠) and failures (✗) are indented details, on stderr. The
+# first header of each command also names where this library lives.
+_ws_tilde()  { print -r -- "${1/#$HOME/~}"; }
+_ws_step()   { print -Pn "%F{#8bd5ca}[ws:$1]%f "; print -r -- "${*:2}"; }
+# _ws_step_top <step> <msg> — a command's first header, plus the library path.
+_ws_step_top() {
+  print -Pn "%F{#8bd5ca}[ws:$1]%f "; print -rn -- "${*:2}"
+  print -P "  %F{#6e738d}(git_workspaces: $(_ws_tilde "$_WS_HOME"))%f"
+}
+_ws_detail() { print -r -- "  $*"; }
+_ws_ok()     { print -Pn "%F{#a6da95}"; print -rn -- "  ✓ $*"; print -P "%f"; }
+_ws_warn()   { { print -Pn "%F{#f5a97f}"; print -rn -- "  ⚠ $*"; print -P "%f"; } >&2; }
+_ws_fail()   { { print -Pn "%F{#ed8796}"; print -rn -- "  ✗ $*"; print -P "%f"; } >&2; }
+# _ws_indent / _ws_nest — prefix every line of stdin: "  " for this library's
+# own helper output, "  │ " for a subprocess's (hook, git) output.
+_ws_indent() { local l; while IFS= read -r l || [[ -n "$l" ]]; do print -r -- "  $l"; done; }
+_ws_nest()   { local l; while IFS= read -r l || [[ -n "$l" ]]; do print -r -- "  │ $l"; done; }
+# _ws_nested <cmd> [args...] — run it with stdout+stderr nested; returns its rc.
+_ws_nested() { { "$@" } 2>&1 | _ws_nest; return ${pipestatus[1]}; }
+# _ws_init_run <phase> <cwd> <main_clone> <dest> <branch> [snapshot-sha] — run
+# the repo's `.ws-init <phase>` in <cwd> with its context env (see
+# _ws_setup_worktree). Wrap in _ws_nested to show its output as a hook's.
+_ws_init_run() {
+  ( cd "$2" && WS_DEST="$4" WS_BRANCH="$5" WS_MAIN_CLONE="$3" WS_SNAPSHOT="${6:-}" "$3/.ws-init" "$1" )
+}
+# _ws_hook_header <name> <file> [note] — announce a hook; a symlinked file
+# shows where it really lives.
+_ws_hook_header() {
+  local where=$(_ws_tilde "$2")
+  [[ -L "$2" ]] && where+=" → $(_ws_tilde "${2:A}")"
+  print -Pn "%F{#c6a0f6}[hook:$1]%f "; print -r -- "$where${3:+  $3}"
+}
+
 # _ws_hook <name> [VAR=value ...] — run the user hook $WS_HOOKS_DIR/<name> if
 # it exists and is executable, with the given context vars set for THAT
 # process only (so a shell-exported WS_NAME never leaks into a hook about a
@@ -83,6 +125,16 @@ _ws_hook() {
   env "$@" "$hook"; local rc=$?
   (( rc == 127 )) && rc=126
   return $rc
+}
+
+# _ws_hook_shown <name> [VAR=value ...] — _ws_hook, announced with a
+# [hook:<name>] header and its output nested. For hooks whose output is for the
+# human; `switch` and `active` (whose stdout is consumed) use _ws_hook.
+_ws_hook_shown() {
+  local hook="$WS_HOOKS_DIR/$1"
+  [[ -x "$hook" ]] || return 127
+  _ws_hook_header "$1" "$hook"
+  _ws_nested _ws_hook "$@"
 }
 
 # Ask a yes/no question on the tty; return 0 only on an explicit yes. Defaults
@@ -129,7 +181,7 @@ _ws_main_branch() {
 # _ws_mtimes save|restore … — see lib/ws_mtimes.py (one process for all files).
 _ws_mtimes() {
   if ! command -v python3 >/dev/null 2>&1; then
-    echo_warn "⚠ python3 not found — skipping mtimes (expect a fuller recompile)"
+    _ws_warn "python3 not found — skipping mtimes (expect a fuller recompile)"
     return 1
   fi
   python3 "$_WS_HOME/lib/ws_mtimes.py" "$@"
@@ -259,11 +311,12 @@ _ws_snapshot() {
   local main_clone=$(_ws_resolve_main_clone "$1") force=""
   [[ "${2:-}" == --force ]] && force=1
   local repo="${main_clone:t}"
+  _ws_step_top snapshot "$repo"
   if [[ ! -e "$main_clone/.git" ]]; then
-    echo_failure "No git repo at $main_clone"; return 1
+    _ws_fail "No git repo at $main_clone"; return 1
   fi
   if ! _ws_snapshot_opted_in "$main_clone"; then
-    echo_failure "$repo: its .ws-init has no build phase (ws_build) — nothing to snapshot"; return 1
+    _ws_fail "$repo: its .ws-init has no build phase (ws_build) — nothing to snapshot"; return 1
   fi
 
   local sdir=$(_ws_snapshot_dir "$main_clone")
@@ -271,36 +324,37 @@ _ws_snapshot() {
   if ! mkdir "$sdir/lock" 2>/dev/null; then
     local holder=$(cat "$sdir/lock/pid" 2>/dev/null)
     if [[ -n "$holder" ]] && kill -0 "$holder" 2>/dev/null; then
-      echo_info "$repo: a snapshot is already being made (pid $holder) — skipping"; return 0
+      _ws_detail "a snapshot is already being made (pid $holder) — skipping"; return 0
     fi
-    echo_warn "$repo: clearing a stale snapshot lock (pid ${holder:-?} is gone)"
+    _ws_warn "clearing a stale snapshot lock (pid ${holder:-?} is gone)"
     rm -rf "$sdir/lock"; mkdir "$sdir/lock" || return 1
   fi
   echo $$ >"$sdir/lock/pid"
 
   {
     local main_branch=$(_ws_main_branch "$main_clone") fetched=1
-    if ! git -C "$main_clone" fetch -q origin; then
+    _ws_detail "git fetch origin in $(_ws_tilde "$main_clone")"
+    if ! _ws_nested git -C "$main_clone" fetch -q origin; then
       fetched=""
-      echo_warn "⚠ $repo: couldn't fetch origin — snapshotting origin/$main_branch as last fetched"
+      _ws_warn "couldn't fetch origin — snapshotting origin/$main_branch as last fetched"
     fi
     local sha=$(git -C "$main_clone" rev-parse -q --verify "origin/$main_branch^{commit}")
     if [[ -z "$sha" ]]; then
-      echo_failure "$repo: no origin/$main_branch to snapshot"; return 1
+      _ws_fail "no origin/$main_branch to snapshot"; return 1
     fi
 
     if [[ -z "$force" && -f "$sdir/$sha/commit" ]]; then
       [[ "${${:-$sdir/latest}:A}" == "$sdir/$sha" ]] || _ws_snapshot_point_latest "$sdir" "$sha"
       [[ -n "$fetched" ]] && date +%s >"$sdir/checked"
-      echo_info "$repo: snapshot ${sha:0:12} is current"
+      _ws_ok "origin/$main_branch is ${sha:0:12} — snapshot ${sha:0:12} is current, nothing to build"
       return 0
     fi
 
     local co="$sdir/checkout"
     if [[ ! -e "$co/.git" ]]; then
-      echo_info "$repo: creating the snapshot checkout..."
+      _ws_detail "creating the snapshot checkout $(_ws_tilde "$co") at ${sha:0:12}, seeded from the main clone's build"
       git -C "$main_clone" worktree prune
-      git -C "$main_clone" worktree add -q --detach "$co" "$sha" || { echo_failure "$repo: couldn't create $co"; return 1; }
+      _ws_nested git -C "$main_clone" worktree add -q --detach "$co" "$sha" || { _ws_fail "couldn't create $co"; return 1; }
       # Seed it from the main clone's build (if any) so the first build is
       # incremental too. Same rules as a new workspace.
       local d
@@ -311,20 +365,23 @@ _ws_snapshot() {
     else
       # Only files that differ between the two commits are rewritten (and get
       # a fresh mtime), so the build recompiles just what changed.
-      git -C "$co" checkout -q --detach -f "$sha" || { echo_failure "$repo: couldn't check out ${sha:0:12} in $co"; return 1; }
+      _ws_detail "moving the snapshot checkout $(_ws_tilde "$co") to ${sha:0:12} (origin/$main_branch)"
+      _ws_nested git -C "$co" checkout -q --detach -f "$sha" || { _ws_fail "couldn't check out ${sha:0:12} in $co"; return 1; }
     fi
 
-    echo_info "$repo: building ${sha:0:12} (log: $sdir/build.log)..."
+    _ws_hook_header ".ws-init build" "$main_clone/.ws-init" "(in the snapshot checkout; output → $(_ws_tilde "$sdir/build.log"))"
     ( cd "$co" && WS_DEST="$co" WS_BRANCH="" WS_MAIN_CLONE="$main_clone" WS_SNAPSHOT="$sha" \
         "$main_clone/.ws-init" build ) >"$sdir/build.log" 2>&1
     local rc=$?
+    _ws_step snapshot "$repo: build of ${sha:0:12} finished (rc $rc)"
     if (( rc != 0 )); then
       printf 'sha=%s\nat=%s\nrc=%s\n' "$sha" "$(date +%s)" "$rc" >"$sdir/last-error"
-      echo_failure "$repo: build of ${sha:0:12} failed (rc $rc) — keeping the previous snapshot. Last lines of $sdir/build.log:"
-      tail -n 20 "$sdir/build.log" >&2
+      _ws_fail "build of ${sha:0:12} failed (rc $rc) — keeping the previous snapshot. Last lines of build.log:"
+      tail -n 20 "$sdir/build.log" | _ws_nest >&2
       return 1
     fi
 
+    _ws_detail "saving the build to $(_ws_tilde "$sdir/$sha")"
     local tmp="$sdir/$sha.tmp"
     rm -rf "$tmp"; mkdir "$tmp" || return 1
     for d in "${_WS_ARTIFACT_DIRS[@]}"; do
@@ -345,7 +402,7 @@ _ws_snapshot() {
       [[ -f "$s/commit" ]] || continue
       (( ++n >= WS_SNAPSHOT_KEEP )) && rm -rf "$s"
     done
-    echo_success "$repo: snapshot ${sha:0:12} ready"
+    _ws_ok "snapshot ${sha:0:12} ready — new worktrees start from it (latest)"
   } always {
     rm -rf "$sdir/lock"
   }
@@ -382,9 +439,10 @@ _ws_snapshot_status() {
 # cwd rewriting was retired — ploy-server sets elixirc_options: [check_cwd: false].)
 _ws_setup_worktree() {
   local main_clone="$1" branch="$2" dest="$3"
+  local repo="${main_clone:t}"
 
   if [[ -d "$dest" ]]; then
-    echo_failure "Worktree directory already exists: $dest"
+    _ws_fail "Worktree directory already exists: $dest"
     return 1
   fi
 
@@ -414,16 +472,22 @@ _ws_setup_worktree() {
   local snap="" snap_sha=""
   if [[ -z "${WS_FRESH:-}" ]] && snap=$(_ws_snapshot_usable "$main_clone"); then
     snap_sha=$(_ws_snapshot_field "$snap" sha)
-    echo_info "Using snapshot ${snap_sha:0:12} of $(basename "$main_clone") (built $(_ws_age "$(_ws_snapshot_field "$snap" built)") ago)"
+    _ws_step snapshot "$repo: using snapshot ${snap_sha:0:12} (built $(_ws_age "$(_ws_snapshot_field "$snap" built)") ago) — $(_ws_tilde "$snap")"
   else
     snap=""
+    if _ws_snapshot_opted_in "$main_clone"; then
+      if [[ -n "${WS_FRESH:-}" ]]; then
+        _ws_step snapshot "$repo: not using a snapshot (WS_FRESH set) — latest main, build from the main clone"
+      else
+        _ws_step snapshot "$repo: no usable snapshot (see ws-snapshot.sh status) — build from the main clone"
+      fi
+    fi
   fi
 
   if [[ -x "$main_clone/.ws-init" ]]; then
-    echo_info "Running .ws-init pre from $(basename "$main_clone")..."
-    if ! ( cd "$main_clone" && WS_DEST="$dest" WS_BRANCH="$branch" WS_MAIN_CLONE="$main_clone" \
-             WS_SNAPSHOT="$snap_sha" "$main_clone/.ws-init" pre ); then
-      echo_failure ".ws-init pre failed — aborting worktree creation for $(basename "$main_clone")"
+    _ws_hook_header ".ws-init pre" "$main_clone/.ws-init" "(in $(_ws_tilde "$main_clone"))"
+    if ! _ws_nested _ws_init_run pre "$main_clone" "$main_clone" "$dest" "$branch" "$snap_sha"; then
+      _ws_fail ".ws-init pre failed — aborting worktree creation for $repo"
       return 1
     fi
   fi
@@ -433,9 +497,9 @@ _ws_setup_worktree() {
   # A failed fetch (GitHub down, no network) is NOT fatal: the workspace is based
   # on the LOCAL default branch anyway, so the only cost is that the behind/ahead
   # check below reads a stale origin/<main>. Warn loudly and carry on.
-  echo_info "Fetching origin in $(basename "$main_clone")..."
-  if ! git -C "$main_clone" fetch origin; then
-    echo_warn "⚠ We couldn't fetch origin for $(basename "$main_clone") — continuing with the local $main_branch as it stands (it may be behind)"
+  _ws_step git "$repo: fetch origin"
+  if ! _ws_nested git -C "$main_clone" fetch origin; then
+    _ws_warn "We couldn't fetch origin for $repo — continuing with the local $main_branch as it stands (it may be behind)"
   fi
 
   # New branches are based on the LOCAL default branch; whether that branch is
@@ -450,18 +514,17 @@ _ws_setup_worktree() {
     # matches the sources (up to one snapshot interval behind origin).
     base_ref="$snap_sha"
     local behind=$(git -C "$main_clone" rev-list --count "$snap_sha..origin/$main_branch" 2>/dev/null)
-    (( behind > 0 )) && echo_info "Snapshot is $behind commit(s) behind origin/$main_branch (WS_FRESH=1 for the latest, built here)"
+    (( behind > 0 )) && _ws_detail "the snapshot is $behind commit(s) behind origin/$main_branch (WS_FRESH=1 for the latest, built here)"
   elif git -C "$main_clone" show-ref --verify --quiet "refs/heads/$main_branch"; then
     base_ref="$main_branch"
     if git -C "$main_clone" show-ref --verify --quiet "refs/remotes/origin/$main_branch"; then
       local behind=$(git -C "$main_clone" rev-list --count "$main_branch..origin/$main_branch" 2>/dev/null)
       local ahead=$(git -C "$main_clone" rev-list --count "origin/$main_branch..$main_branch" 2>/dev/null)
-      (( behind > 0 )) && echo_warn "⚠ Local $main_branch is $behind commit(s) behind origin/$main_branch — basing the workspace on the stale local branch anyway"
-      (( ahead > 0 )) && echo_info "Local $main_branch has $ahead unpushed commit(s); the workspace will include them"
+      (( behind > 0 )) && _ws_warn "Local $main_branch is $behind commit(s) behind origin/$main_branch — basing the workspace on the stale local branch anyway"
+      (( ahead > 0 )) && _ws_detail "local $main_branch has $ahead unpushed commit(s); the workspace will include them"
     fi
   fi
 
-  echo_info "Creating worktree at $dest..."
   local remote_exists=false local_exists=false
   git -C "$main_clone" show-ref --verify --quiet "refs/remotes/origin/$branch" 2>/dev/null && remote_exists=true
   git -C "$main_clone" show-ref --verify --quiet "refs/heads/$branch" 2>/dev/null && local_exists=true
@@ -472,35 +535,41 @@ _ws_setup_worktree() {
     local where=""
     [[ "$local_exists" == true ]] && where="locally"
     [[ "$remote_exists" == true ]] && where="${where:+$where and }on origin"
-    echo_warn "⚠ Branch '$branch' already exists ($where) in $(basename "$main_clone")."
-    echo_warn "  A new workspace branch should not already exist."
+    _ws_warn "Branch '$branch' already exists ($where) in $repo."
+    _ws_warn "A new workspace branch should not already exist."
     if ! _ws_confirm "  Use the existing branch anyway?"; then
-      echo_failure "Aborted — branch '$branch' left untouched."
+      _ws_fail "Aborted — branch '$branch' left untouched."
       return 1
     fi
   fi
 
+  local -a add_args
   if [[ "$remote_exists" == true ]]; then
-    echo_info "Checking out existing remote branch '$branch'..."
-    git -C "$main_clone" worktree add "$dest" "$branch" || { echo_failure "Failed to create worktree"; return 1; }
+    _ws_step git "$repo: worktree at $(_ws_tilde "$dest") — existing remote branch '$branch'"
+    add_args=("$dest" "$branch")
   elif [[ "$local_exists" == true ]]; then
-    echo_info "Using existing local branch '$branch'..."
-    git -C "$main_clone" worktree add "$dest" "$branch" || { echo_failure "Failed to create worktree"; return 1; }
+    _ws_step git "$repo: worktree at $(_ws_tilde "$dest") — existing local branch '$branch'"
+    add_args=("$dest" "$branch")
   else
-    echo_info "Creating new branch '$branch' from $base_ref..."
-    git -C "$main_clone" worktree add "$dest" -b "$branch" "$base_ref" || { echo_failure "Failed to create worktree"; return 1; }
+    local from="$base_ref"
+    [[ -n "$snap" ]] && from="the snapshot's commit ${snap_sha:0:12}"
+    _ws_step git "$repo: worktree at $(_ws_tilde "$dest") — new branch '$branch' from $from"
+    add_args=("$dest" -b "$branch" "$base_ref")
   fi
+  _ws_nested git -C "$main_clone" worktree add "${add_args[@]}" || { _ws_fail "Failed to create worktree"; return 1; }
 
   # Copy the gitignored build dirs (deps/, _build/, node_modules/) from the
   # snapshot, or else from the main clone. COW clones, mtimes preserved. Without
   # node_modules e.g. `npm run dev` can't find local bins like vite.
   local src_dir="${snap:-$main_clone}" d
-  for d in "${_WS_ARTIFACT_DIRS[@]}"; do
-    if [[ -d "$src_dir/$d" ]]; then
-      echo_info "Copying $d/..."
-      _ws_copy "$src_dir/$d" "$dest/$d"
-    fi
-  done
+  local -a copied
+  for d in "${_WS_ARTIFACT_DIRS[@]}"; do [[ -d "$src_dir/$d" ]] && copied+=("$d/"); done
+  if (( ${#copied} )); then
+    _ws_step copy "$repo: build dirs ${copied[*]} from $([[ -n "$snap" ]] && echo "the snapshot" || echo "the main clone") $(_ws_tilde "$src_dir")"
+    for d in "${_WS_ARTIFACT_DIRS[@]}"; do
+      [[ -d "$src_dir/$d" ]] && _ws_copy "$src_dir/$d" "$dest/$d"
+    done
+  fi
 
   # git worktree add stamps EVERY checked-out file with the current time, which
   # breaks Elixir's incremental build. On `mix compile`, Mix compares the mtime
@@ -513,11 +582,11 @@ _ws_setup_worktree() {
   # commit — a file that differs (an existing branch, a stale main clone) keeps
   # "now" so it's seen as changed. (Repo-agnostic: it's just file mtimes.)
   if [[ -n "$snap" ]]; then
-    echo_info "Restoring file mtimes from the snapshot..."
-    _ws_mtimes restore "$dest" "$snap_sha" --from-file "$snap/mtimes"
+    _ws_step mtimes "$repo: source file mtimes as recorded in the snapshot"
+    _ws_mtimes restore "$dest" "$snap_sha" --from-file "$snap/mtimes" | _ws_indent
   else
-    echo_info "Restoring file mtimes from $(basename "$main_clone")..."
-    _ws_mtimes restore "$dest" "$(git -C "$main_clone" rev-parse HEAD)" --from-dir "$main_clone"
+    _ws_step mtimes "$repo: source file mtimes from the main clone $(_ws_tilde "$main_clone")"
+    _ws_mtimes restore "$dest" "$(git -C "$main_clone" rev-parse HEAD)" --from-dir "$main_clone" | _ws_indent
   fi
 
   # NOTE: do NOT bump _build/deps mtimes to "now". _ws_copy already
@@ -584,35 +653,42 @@ _ws_setup_worktree() {
   # the worktree already has (a TRACKED .env/.mcp.json/… was checked out by
   # `worktree add`; ln -sf over it would leave the worktree permanently dirty
   # with a typechange).
+  local -a linked
+  local envrc_note=""
   if [[ -e "$main_clone/.env" && ! -e "$dest/.env" ]]; then
     ln -sf "$main_clone/.env" "$dest/.env"
-    echo_success "Symlinked .env"
+    linked+=(.env)
   fi
   if [[ -e "$dest/.envrc" ]]; then
     # The repo tracks its own .envrc (e.g. one that self-derives per-worktree
     # isolation) — nothing to symlink, just authorise it for direnv.
     direnv allow "$dest" 2>/dev/null || true
-    echo_success "Authorised tracked .envrc"
+    envrc_note="authorised the repo's tracked .envrc"
   # Skip the .envrc symlink when the repo has a .ws-init hook — that hook
   # generates its own per-worktree .envrc, so there's nothing to symlink (and
   # writing over a symlink would clobber the main clone's file).
   elif [[ -f "$main_clone/.envrc" && ! -x "$main_clone/.ws-init" ]]; then
     ln -sf "$main_clone/.envrc" "$dest/.envrc"
-    echo_success "Symlinked .envrc"
     direnv allow "$dest"
+    linked+=(.envrc)
   fi
   if [[ -f "$main_clone/.mcp.json" && ! -e "$dest/.mcp.json" ]]; then
     ln -sf "$main_clone/.mcp.json" "$dest/.mcp.json"
-    echo_success "Symlinked .mcp.json"
+    linked+=(.mcp.json)
   fi
   if [[ -f "$main_clone/.claude/settings.local.json" && ! -e "$dest/.claude/settings.local.json" ]]; then
     mkdir -p "$dest/.claude"
     ln -sf "$main_clone/.claude/settings.local.json" "$dest/.claude/settings.local.json"
-    echo_success "Symlinked .claude/settings.local.json"
+    linked+=(.claude/settings.local.json)
   fi
   if [[ -f "$main_clone/CLAUDE.local.md" && ! -e "$dest/CLAUDE.local.md" ]]; then
     ln -sf "$main_clone/CLAUDE.local.md" "$dest/CLAUDE.local.md"
-    echo_success "Symlinked CLAUDE.local.md"
+    linked+=(CLAUDE.local.md)
+  fi
+  if (( ${#linked} )) || [[ -n "$envrc_note" ]]; then
+    _ws_step links "$repo: env files"
+    (( ${#linked} )) && _ws_detail "symlinked from the main clone: ${linked[*]}"
+    [[ -n "$envrc_note" ]] && _ws_detail "$envrc_note"
   fi
 
   # The `post` phase of the same .ws-init hook (see the `pre` invocation above).
@@ -620,9 +696,9 @@ _ws_setup_worktree() {
   # per-workspace state (ports, DB, env, …) without the workspace layer knowing
   # anything project-specific. cwd == WS_DEST here.
   if [[ -x "$main_clone/.ws-init" ]]; then
-    echo_info "Running .ws-init post from $(basename "$main_clone")..."
-    ( cd "$dest" && WS_DEST="$dest" WS_BRANCH="$branch" WS_MAIN_CLONE="$main_clone" \
-        "$main_clone/.ws-init" post )
+    _ws_hook_header ".ws-init post" "$main_clone/.ws-init" "(in $(_ws_tilde "$dest"))"
+    _ws_nested _ws_init_run post "$dest" "$main_clone" "$dest" "$branch" "$snap_sha" \
+      || _ws_warn ".ws-init post exited non-zero for $repo — the worktree is created; check the output above"
   fi
 }
 
@@ -656,18 +732,19 @@ _ws_create() {
   local short=$(_ws_short_name "$branch")
   local workspace="$WS_ROOT/$short"
 
+  _ws_step_top create "workspace '$short' (branch '$branch') from $repo"
   # A leftover empty dir (e.g. from a previously aborted create) shouldn't block
   # us — only refuse if the workspace actually has contents.
   if [[ -d "$workspace" && -n "$(ls -A "$workspace" 2>/dev/null)" ]]; then
-    echo_failure "Workspace already exists (and is not empty): $workspace"
+    _ws_fail "Workspace already exists (and is not empty): $workspace"
     return 1
   fi
   local hook_rc
   if [[ -z "$no_window" ]]; then
-    _ws_hook pre-create WS_NAME="$short" WS_DIR="$workspace" WS_ROOT_DIR="$workspace" WS_BRANCH="$branch"
+    _ws_hook_shown pre-create WS_NAME="$short" WS_DIR="$workspace" WS_ROOT_DIR="$workspace" WS_BRANCH="$branch"
     hook_rc=$?
     if (( hook_rc != 0 && hook_rc != 127 )); then
-      echo_failure "pre-create hook refused workspace '$short' (rc $hook_rc)"
+      _ws_fail "pre-create hook refused workspace '$short' (rc $hook_rc)"
       return 1
     fi
   fi
@@ -680,13 +757,13 @@ _ws_create() {
   # --bg asks it not to switch focus; --no-window skips it entirely (headless
   # scratch workspaces no human will type into).
   if [[ -z "$no_window" ]]; then
-    _ws_hook created WS_NAME="$short" WS_DIR="$workspace/$repo" WS_ROOT_DIR="$workspace" WS_BRANCH="$branch" ${bg:+WS_BG=1}
+    _ws_hook_shown created WS_NAME="$short" WS_DIR="$workspace/$repo" WS_ROOT_DIR="$workspace" WS_BRANCH="$branch" ${bg:+WS_BG=1}
     hook_rc=$?
-    (( hook_rc == 0 || hook_rc == 127 )) || echo_warn "created hook failed for '$short' (rc $hook_rc)"
+    (( hook_rc == 0 || hook_rc == 127 )) || _ws_warn "created hook failed for '$short' (rc $hook_rc)"
   fi
 
-  echo_success "Workspace ready: $workspace"
-  echo_success "Added '$repo' on branch '$branch'"
+  _ws_step done "workspace '$short' ready"
+  _ws_ok "$(_ws_tilde "$workspace") — '$repo' on branch '$branch'"
   return 0
 }
 
@@ -712,20 +789,22 @@ _ws_add() {
     main_clone=$(_ws_resolve_main_clone "$arg")
     repo=$(basename "$main_clone")
 
+    _ws_step_top add "$repo → workspace '${workspace:t}' (branch '$branch')"
     if [[ ! -e "$main_clone/.git" ]]; then
-      echo_failure "No git repo at $main_clone — skipping '$arg'"
+      _ws_fail "No git repo at $main_clone — skipping '$arg'"
       continue
     fi
     if [[ -d "$workspace/$repo" ]]; then
-      echo_failure "Repo '$repo' already in workspace — skipping"
+      _ws_fail "Repo '$repo' already in workspace — skipping"
       continue
     fi
-    echo_info "Adding '$repo' on branch '$branch'..."
     if _ws_setup_worktree "$main_clone" "$branch" "$workspace/$repo"; then
-      echo_success "Added '$repo'"
+      _ws_step done "added '$repo'"
+      _ws_ok "$(_ws_tilde "$workspace/$repo") — on branch '$branch'"
       _WS_LAST_ADDED="$workspace/$repo"
     else
-      echo_failure "Failed to add '$repo'"
+      _ws_step done "adding '$repo' failed"
+      _ws_fail "Failed to add '$repo'"
     fi
   done
 }
@@ -796,17 +875,18 @@ _ws_delete() {
   local branch=$(_ws_branch "$workspace" 2>/dev/null)   # before the worktrees go
   local hook_rc
 
+  _ws_step_top delete "workspace '$short'${force:+ (--force)}"
   # The user's pre-delete hook may refuse (rc 1 — e.g. open PRs whose branch
   # lives only in this worktree). Unknown (other non-zero) warns and proceeds;
   # --force skips the hook entirely.
   if [[ -z "$force" ]]; then
-    _ws_hook pre-delete WS_NAME="$short" WS_DIR="$workspace" WS_ROOT_DIR="$workspace" WS_BRANCH="$branch"
+    _ws_hook_shown pre-delete WS_NAME="$short" WS_DIR="$workspace" WS_ROOT_DIR="$workspace" WS_BRANCH="$branch"
     hook_rc=$?
     if (( hook_rc == 1 )); then
-      echo_failure "Refusing to delete workspace $short (pre-delete hook said no; use --force to override)"
+      _ws_fail "Refusing to delete workspace $short (pre-delete hook said no; use --force to override)"
       return 1
     elif (( hook_rc != 0 && hook_rc != 127 )); then
-      echo_warn "pre-delete hook for $short returned $hook_rc (unknown) — proceeding"
+      _ws_warn "pre-delete hook for $short returned $hook_rc (unknown) — proceeding"
     fi
   fi
 
@@ -822,28 +902,28 @@ _ws_delete() {
     # half-deleted, so warn and carry on.
     if [[ -x "$main_worktree/.ws-init" ]]; then
       member_branch=$(git -C "$member" branch --show-current 2>/dev/null)
-      echo_info "Running .ws-init delete from $(basename "$main_worktree")..."
-      ( cd "$member" && WS_DEST="$member" WS_BRANCH="$member_branch" WS_MAIN_CLONE="$main_worktree" \
-          "$main_worktree/.ws-init" delete ) \
-        || echo_warn ".ws-init delete failed for $member — continuing with deletion"
+      _ws_hook_header ".ws-init delete" "$main_worktree/.ws-init" "(in $(_ws_tilde "$member"))"
+      _ws_nested _ws_init_run delete "$member" "$main_worktree" "$member" "$member_branch" \
+        || _ws_warn ".ws-init delete failed for $member — continuing with deletion"
     fi
 
-    echo_info "Removing worktree $member (branch kept)..."
+    _ws_step git "${member:t}: remove worktree $(_ws_tilde "$member") (branch kept)"
     git -C "$main_worktree" worktree remove --force "$member" 2>/dev/null
   done
 
   # Remove whatever remains of the workspace dir.
   [[ -d "$workspace" ]] && rm -rf "$workspace"
 
-  echo_success "Deleted workspace: $workspace"
+  _ws_step done "workspace '$short' deleted"
+  _ws_ok "$(_ws_tilde "$workspace") removed (branches kept)"
 
   # LAST, always: the user's `deleted` hook (release leases, kill the window,
   # …). It may kill the very window this shell runs in, SIGHUPping us —
   # anything below it would silently not run. Its rc is reported but never
   # changes ours: the workspace IS gone.
-  _ws_hook deleted WS_NAME="$short" WS_DIR="$workspace" WS_ROOT_DIR="$workspace" WS_BRANCH="$branch"
+  _ws_hook_shown deleted WS_NAME="$short" WS_DIR="$workspace" WS_ROOT_DIR="$workspace" WS_BRANCH="$branch"
   hook_rc=$?
-  (( hook_rc == 0 || hook_rc == 127 )) || echo_warn "deleted hook failed for '$short' (rc $hook_rc)"
+  (( hook_rc == 0 || hook_rc == 127 )) || _ws_warn "deleted hook failed for '$short' (rc $hook_rc)"
   return 0
 }
 
@@ -995,8 +1075,8 @@ function wsp() {
     return 0
   fi
 
-  echo_info "Inactive workspaces to delete (${#purge}):"
-  for label in "${labels[@]}"; do print -r -- "  $label"; done
+  _ws_step_top purge "inactive workspaces to delete (${#purge}):"
+  for label in "${labels[@]}"; do _ws_detail "$label"; done
   if [[ -z "$yes" ]] && ! _ws_confirm "Delete these ${#purge} workspace(s)?"; then
     echo_failure "Aborted — nothing deleted."
     return 1
