@@ -146,7 +146,9 @@ they open with nothing to compile:
    `$WS_SNAPSHOT_ROOT/<repo>/checkout`) to it, run `.ws-init build` there, then
    clone the build dirs + record the mtimes into `$WS_SNAPSHOT_ROOT/<repo>/<sha>/`
    and point `latest` at it. A failed build keeps the previous snapshot. When
-   origin hasn't moved, a run is just the fetch.
+   origin hasn't moved, a run is just the fetch. Several repos are snapshotted
+   in parallel, each repo's output printed as one block; each snapshot records
+   how long its build took (`took=` in its `commit` file, shown by `status`).
 2. **Using one** (any workspace create/add): the branch is based on the
    snapshot's commit (so up to one schedule interval behind origin), the build
    dirs are cloned from the snapshot, and each source file gets the mtime it had

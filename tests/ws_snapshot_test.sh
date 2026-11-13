@@ -47,7 +47,15 @@ echo "$1 PWD=$PWD WS_SNAPSHOT=${WS_SNAPSHOT-unset} HEAD=$(git rev-parse HEAD 2>/
 echo "hello from the $1 hook"
 ws_build() {
   [ -e "$BUILD_FAIL" ] && { echo "boom"; exit 3; }
+  [ -e "$BUILD_FAIL.${WS_MAIN_CLONE##*/}" ] && { echo "boom"; exit 3; }
   mkdir -p _build deps
+  # RENDEZVOUS: wait (up to 5s) for RENDEZVOUS_N builds to have started, then
+  # record how many had — only parallel builds all see RENDEZVOUS_N.
+  if [ -n "${RENDEZVOUS:-}" ]; then
+    touch "$RENDEZVOUS/${WS_MAIN_CLONE##*/}"
+    for _ in $(seq 50); do [ "$(ls "$RENDEZVOUS" | wc -l)" -ge "$RENDEZVOUS_N" ] && break; sleep 0.1; done
+    ls "$RENDEZVOUS" | wc -l | tr -d ' ' >_build/met
+  fi
   cat lib/*.ex >_build/out
   git rev-parse HEAD >_build/sha
   echo dep >deps/dep
@@ -220,6 +228,39 @@ echo "== rm removes snapshots and the checkout worktree"
 snap rm app
 assert_no_file "snapshot dir gone" "$S"
 assert_eq "worktree unregistered" "$(git -C "$main" worktree list | grep -c snapshots)" "0"
+
+echo "== --all snapshots several repos in parallel; output stays in per-repo blocks"
+mkrepo app2 with-build
+mkrepo app3 with-build
+export RENDEZVOUS="$T/rendezvous" RENDEZVOUS_N=3
+mkdir -p "$RENDEZVOUS"
+snap --all
+unset RENDEZVOUS RENDEZVOUS_N
+assert_eq "rc" "$RC" 0
+for r in app app2 app3; do
+  assert_eq "$r: snapshot made" "$(cat "$WS_SNAPSHOT_ROOT/$r/latest/_build/sha" 2>/dev/null)" "$(origin_sha $r)"
+  assert_eq "$r: built alongside the others" "$(cat "$WS_SNAPSHOT_ROOT/$r/latest/_build/met" 2>/dev/null)" "3"
+done
+plain="$(sed $'s/\x1b\\[[0-9;]*m//g' <<<"$OUT")"
+order="$(sed -nE 's/^\[ws:snapshot\] (app[0-9]*)[: ].*/\1/p' <<<"$plain" | uniq | tr '\n' ' ')"
+assert_eq "blocks contiguous, in the order given" "$order" "app app2 app3 "
+assert_eq "no stray temp dirs" "$(ls "${TMPDIR:-/tmp}" | grep -c "^ws-snapshot\.")" "0"
+
+echo "== build duration recorded and shown"
+assert_contains "took= in the commit file" "$(cat "$WS_SNAPSHOT_ROOT/app2/latest/commit")" "took="
+zws "_ws_snapshot_status '$WS_SRC_ROOT/app2'"
+assert_contains "status shows it" "$OUT" "(build took "
+
+echo "== one repo failing in a parallel run doesn't stop the others"
+push_change app2 lib/a.ex X2
+push_change app3 lib/a.ex X3
+touch "$BUILD_FAIL.app2"
+snap --all
+rm -f "$BUILD_FAIL.app2"
+assert_eq "rc non-zero" "$RC" 1
+assert_ne "app2 kept its old snapshot" "$(cat "$WS_SNAPSHOT_ROOT/app2/latest/_build/sha")" "$(origin_sha app2)"
+assert_eq "app3 still snapshotted" "$(cat "$WS_SNAPSHOT_ROOT/app3/latest/_build/sha")" "$(origin_sha app3)"
+assert_contains "the failure is reported" "$OUT" "app2"
 
 echo
 echo "$pass passed, $fail failed"

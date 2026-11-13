@@ -330,7 +330,11 @@ _ws_snapshot() {
     _ws_warn "clearing a stale snapshot lock (pid ${holder:-?} is gone)"
     rm -rf "$sdir/lock"; mkdir "$sdir/lock" || return 1
   fi
-  echo $$ >"$sdir/lock/pid"
+  # This process's own pid — not $$, which in a background job (ws-snapshot.sh
+  # runs repos in parallel) is the parent's, so a stale-lock check would miss
+  # an orphaned build that's still running.
+  zmodload -F zsh/system p:sysparams 2>/dev/null
+  echo "${sysparams[pid]:-$$}" >"$sdir/lock/pid"
 
   {
     local main_branch=$(_ws_main_branch "$main_clone") fetched=1
@@ -371,10 +375,11 @@ _ws_snapshot() {
     fi
 
     _ws_hook_header ".ws-init build" "$main_clone/.ws-init" "(in the snapshot checkout; output → $(_ws_tilde "$sdir/build.log"))"
+    local started=$(date +%s)
     ( cd "$co" && WS_DEST="$co" WS_BRANCH="" WS_MAIN_CLONE="$main_clone" WS_SNAPSHOT="$sha" \
         "$main_clone/.ws-init" build ) >"$sdir/build.log" 2>&1
-    local rc=$?
-    _ws_step snapshot "$repo: build of ${sha:0:12} finished (rc $rc)"
+    local rc=$? took=$(( $(date +%s) - started ))
+    _ws_step snapshot "$repo: build of ${sha:0:12} finished (rc $rc, ${took}s)"
     if (( rc != 0 )); then
       printf 'sha=%s\nat=%s\nrc=%s\n' "$sha" "$(date +%s)" "$rc" >"$sdir/last-error"
       _ws_fail "build of ${sha:0:12} failed (rc $rc) — keeping the previous snapshot. Last lines of build.log:"
@@ -389,7 +394,7 @@ _ws_snapshot() {
       [[ -d "$co/$d" ]] && { _ws_copy "$co/$d" "$tmp/$d" || { rm -rf "$tmp"; return 1; } }
     done
     _ws_mtimes save "$co" "$tmp/mtimes" || { rm -rf "$tmp"; return 1; }
-    printf 'sha=%s\nbranch=%s\nbuilt=%s\n' "$sha" "$main_branch" "$(date +%s)" >"$tmp/commit"
+    printf 'sha=%s\nbranch=%s\nbuilt=%s\ntook=%s\n' "$sha" "$main_branch" "$(date +%s)" "$took" >"$tmp/commit"
     rm -rf "$sdir/$sha"
     mv "$tmp" "$sdir/$sha" && _ws_snapshot_point_latest "$sdir" "$sha" || return 1
     [[ -n "$fetched" ]] && date +%s >"$sdir/checked"
@@ -418,7 +423,8 @@ _ws_snapshot_status() {
     snap="${snap:A}"
     local sha=$(_ws_snapshot_field "$snap" sha) mb=$(_ws_snapshot_field "$snap" branch)
     local behind=$(git -C "$main_clone" rev-list --count "$sha..origin/$mb" 2>/dev/null)
-    print -r -- "  latest:   ${sha:0:12}, built $(_ws_age "$(_ws_snapshot_field "$snap" built)") ago, ${behind:-?} commit(s) behind origin/$mb (as last fetched)"
+    local took=$(_ws_snapshot_field "$snap" took)
+    print -r -- "  latest:   ${sha:0:12}, built $(_ws_age "$(_ws_snapshot_field "$snap" built)") ago${took:+ (build took ${took}s)}, ${behind:-?} commit(s) behind origin/$mb (as last fetched)"
     print -r -- "  checked:  $( [[ -f $sdir/checked ]] && echo "$(_ws_age "$(cat "$sdir/checked")") ago" || echo never)"
     if _ws_snapshot_usable "$main_clone" >/dev/null; then
       print -r -- "  in use:   yes — new worktrees start from it"
